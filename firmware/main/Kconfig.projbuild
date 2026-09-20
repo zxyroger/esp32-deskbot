@@ -1,0 +1,661 @@
+menu "ESP32-S3 Scratch 服务器配置"
+
+    menu "WiFi (STA)"
+
+        config TMX_WIFI_SSID
+            string "WiFi 名称 (SSID)"
+            default "YOUR_WIFI_SSID"
+            help
+                板子要连接的路由器/热点名称，必须与 PC 在同一个局域网内。
+
+        config TMX_WIFI_PASSWORD
+            string "WiFi 密码"
+            default "YOUR_WIFI_PASSWORD"
+
+        config TMX_WIFI_MAX_RETRY
+            int "STA 连接最大重试次数 (0 = 一直重试)"
+            range 0 100
+            default 8
+
+        config TMX_USE_STATIC_IP
+            bool "使用静态 IP (默认使用 DHCP)"
+            default n
+
+        config TMX_STATIC_IP
+            string "静态 IP 地址"
+            depends on TMX_USE_STATIC_IP
+            default "192.168.1.50"
+
+        config TMX_STATIC_GATEWAY
+            string "网关地址"
+            depends on TMX_USE_STATIC_IP
+            default "192.168.1.1"
+
+        config TMX_STATIC_NETMASK
+            string "子网掩码"
+            depends on TMX_USE_STATIC_IP
+            default "255.255.255.0"
+
+    endmenu
+
+    config TMX_ENABLE_SOFTAP_FALLBACK
+        bool "STA 连接失败后启动 SoftAP 热点"
+        default y
+        help
+            连不上路由器时自动开一个热点，PC 连上该热点后也能直接控制板子。
+
+    config TMX_SOFTAP_SSID
+        string "SoftAP 热点名称"
+        depends on TMX_ENABLE_SOFTAP_FALLBACK
+        default "ESP32S3-Scratch"
+
+    config TMX_SOFTAP_PASSWORD
+        string "SoftAP 密码 (至少 8 位, 空 = 开放网络)"
+        depends on TMX_ENABLE_SOFTAP_FALLBACK
+        default "scratch32"
+
+    config TMX_TCP_PORT
+        int "Telemetrix TCP 端口"
+        range 1024 65535
+        default 31336
+        help
+            必须与 PC 端 telemetrix_aio_esp32 的 ip_port 一致 (默认 31336)。
+
+    config TMX_UDP_BEACON_ENABLE
+        bool "UDP 广播板子 IP (PC 端自动发现, 不用再去串口看 IP)"
+        default y
+        help
+            打开后板子会周期性向局域网广播自己的地址和端口, 内容形如:
+                ONEGPIO 192.168.0.103 31336
+            PC 端的 tools/find_board.py 和后台守护进程会直接发现板子并把 IP
+            发给网关, 因此 Scratch 里不需要手填 IP 积木。
+            也可以在 PC 上发一条 "ONEGPIO?" 做主动探测, 板子会立刻回一条。
+
+    config TMX_UDP_BEACON_PORT
+        int "UDP 广播/探测端口"
+        depends on TMX_UDP_BEACON_ENABLE
+        range 1024 65535
+        default 31337
+
+    config TMX_UDP_BEACON_INTERVAL_S
+        int "广播间隔 (秒)"
+        depends on TMX_UDP_BEACON_ENABLE
+        range 1 60
+        default 2
+
+    menu "引脚"
+
+        config TMX_I2C_SDA_PIN
+            int "I2C SDA 引脚"
+            range 0 48
+            default 1
+            help
+                本板 (ESP32-S3 + ES8311 + 屏幕) 的 I2C 总线上挂着 ES8311
+                音频 codec (地址 0x30), 所以默认是 SDA=1 / SCL=2。
+                注意 GPIO1/GPIO2 也是 ADC1 的 CH0/CH1 (Scratch 的模拟引脚
+                32/33), 用了音频/I2C 之后这两个模拟引脚就不能再用了。
+
+        config TMX_I2C_SCL_PIN
+            int "I2C SCL 引脚"
+            range 0 48
+            default 2
+
+        config TMX_ADC_LEGACY_PIN_ALIAS
+            bool "把经典 ESP32 模拟引脚号映射到 S3 的 ADC1"
+            default y
+            help
+                Scratch 扩展的模拟输入下拉框只有 32/33/34/35/36/39 (经典 ESP32 的
+                ADC 引脚)，而 ESP32-S3 的 ADC1 对应 GPIO1~GPIO10。
+                打开后，读到 32~39 会按顺序映射到 GPIO1~GPIO6，上报时仍使用原来的
+                引脚号，因此 Scratch 积木可以正常工作。
+
+        config TMX_ALLOW_RESERVED_PINS
+            bool "允许使用保留引脚 (Flash/PSRAM/Strapping)"
+            default n
+            help
+                ESP32-S3 的 GPIO26~GPIO37 通常接在模组内的 Flash/PSRAM 上，
+                GPIO0/45/46 是 Strapping 引脚，默认拒绝使用以免造成启动异常。
+
+    endmenu
+
+    config TMX_DEBUG_REPORTS
+        bool "向客户端发送调试报告 (DEBUG_PRINT)"
+        default n
+        help
+            打开后固件会把参数错误等信息作为 DEBUG_PRINT 报告发给 PC，
+            便于排查接线/引脚问题。
+
+    config TMX_LOG_COMMANDS
+        bool "把每条来自 Scratch 的指令打印到串口"
+        default y
+        help
+            打开后, 固件每执行一条客户端指令就在串口打一行日志, 例如:
+                I (12345) tmx_core: set_mode: pin 4 -> servo
+                I (12345) tmx_core: servo_write: pin 4 -> 90
+            用来确认"点了积木到底有没有传到板子"。
+            积木放在高频循环里时日志会很多, 这里做了限流 (每秒最多 20 行,
+            多出来的会合并成一条 "... 还有 N 条指令没打印" 的汇总),
+            还是嫌吵就在 menuconfig 里把它关掉。
+
+endmenu
+
+menu "LCD (ILI9342C, SPI 屏幕)"
+
+    config TMX_LCD_ENABLE
+        bool "启用 ILI9342C SPI 屏幕 (320x240 横屏)"
+        default y
+        help
+            打开后启动时初始化 ILI9342C 并点亮背光, 屏幕上会先显示方向测试图。
+            屏幕占用的引脚会自动从 Scratch 的数字/模拟引脚里排除, 避免和积木抢脚。
+            不想用屏幕就关掉, 该模块完全不占资源。
+
+    config TMX_LCD_WIDTH
+        int "屏幕宽度 (像素)"
+        default 320
+        help
+            ILI9342C 显存是 320(列) x 240(行), 320x240 就是它的原生方向。
+
+    config TMX_LCD_HEIGHT
+        int "屏幕高度 (像素)"
+        default 240
+
+    config TMX_LCD_SWAP_XY
+        bool "交换 X/Y"
+        default n
+        help
+            ILI9342C 显存是 320 列 x 240 行, 320x240 横屏用不上交换, 保持 n。
+            (换成 ILI9341 那种 240x320 的屏时才需要打开, 否则画面会错位/斜切。)
+
+    config TMX_LCD_MIRROR_X
+        bool "水平镜像 (X)"
+        default y
+
+    config TMX_LCD_MIRROR_Y
+        bool "垂直镜像 (Y)"
+        default y
+        help
+            横屏 (交换 X/Y) 时 X/Y 镜像都开 = ESP-IDF 官方例程的 90° 组合。
+            画面上下颠倒就把这两个都改成 n, 左右反了就把其中一个取反。
+
+    config TMX_LCD_SPI_SCK_PIN
+        int "SPI SCK (CLK) 引脚"
+        range 0 48
+        default 41
+
+    config TMX_LCD_SPI_MOSI_PIN
+        int "SPI MOSI (DIN/SDA) 引脚"
+        range 0 48
+        default 40
+
+    config TMX_LCD_DC_PIN
+        int "LCD DC (RS) 引脚"
+        range 0 48
+        default 39
+
+    config TMX_LCD_CS_PIN
+        int "LCD CS 引脚"
+        range 0 48
+        default 21
+
+    config TMX_LCD_SPI_CLOCK_HZ
+        int "SPI 时钟 (Hz)"
+        range 1000000 80000000
+        default 40000000
+        help
+            屏的写周期比 40MHz 慢, 杜邦线/长线跑 40MHz 容易出现雪花点/噪点,
+            这时把它降到 10000000 ~ 20000000 就稳了。
+
+    config TMX_LCD_BGR
+        bool "BGR 颜色顺序"
+        default y
+        help
+            大多数 9342C/9341 模块是 BGR。红蓝互换 (红变蓝/蓝变红) 时改这里。
+
+    config TMX_LCD_INVERT_COLOR
+        bool "反相显示 (INVON)"
+        default y
+        help
+            颜色像照片底片 (白变黑) 时改这里。不同厂家的屏要求不一样。
+
+    menu "背光"
+
+        config TMX_LCD_BACKLIGHT_PIN
+            int "背光控制引脚"
+            range 0 48
+            default 42
+
+        config TMX_LCD_BACKLIGHT_PERCENT
+            int "开机默认亮度 (%)"
+            range 0 100
+            default 80
+
+        config TMX_LCD_BACKLIGHT_INVERT
+            bool "低电平点亮 (反相)"
+            default y
+            help
+                背光开着的时候反而是灭的、或者关不掉时, 把这个开关取反。
+                默认为 y (按板子给的 DISPLAY_BACKLIGHT_OUTPUT_INVERT true)。
+                如果改成 y 之后屏幕反而变暗/不亮, 说明背光是高电平点亮, 改回 n。
+
+        config TMX_LCD_BACKLIGHT_PWM
+            bool "用 PWM 调亮度 (占用一个 LEDC 通道)"
+            default y
+            help
+                打开后屏幕背光独占 LEDC_TIMER_2 + 下面这个通道, 固件会自动把它们
+                从 Scratch 的 PWM/舵机池里让出来 (PWM 定时器由 3 个变 2 个,
+                通道由 8 个变 7 个)。关掉就只能开/关背光, 不占 LEDC 资源。
+
+        config TMX_LCD_BACKLIGHT_LEDC_CHANNEL
+            int "背光使用的 LEDC 通道 (0~7)"
+            range 0 7
+            default 7
+            depends on TMX_LCD_BACKLIGHT_PWM
+
+    endmenu
+
+    config TMX_LCD_TEST_PATTERN
+        bool "启动时显示彩条测试图"
+        default y
+        help
+            白/黄/青/绿/品红/红/蓝/黑 8 条竖彩条, 用来一眼确认接线、
+            方向 (彩条是竖的=横屏正常) 和颜色顺序是否正确。
+
+    config TMX_LCD_ORIENT_TEST
+        bool "启动时轮播 5 种方向做对比 (排障用)"
+        default n
+        help
+            上电后每 2.5 秒换一种 swap/mirror 组合, 屏幕左上角画 N 个白方块
+            表示"第 N 张"(从 1 开始)。记下哪一张方向正常, 就能一次把方向定好。
+            本板已实测: swap=0 mx=1 my=1 (就是上面的默认值) 方向正确,
+            所以默认关掉; 以后换屏再打开重新对一次即可。
+
+endmenu
+
+menu "音频 (ES8311 Codec)"
+
+    config TMX_AUDIO_ENABLE
+        bool "启用 ES8311 音频输入/输出"
+        default y
+        help
+            板载 ES8311 codec: I2S 全双工 (扬声器 DAC + 麦克风 ADC), 由 I2C 配置,
+            功放 (PA) 由 GPIO 控制。打开后启动时初始化 codec, Scratch 侧多出:
+                「播放音调 频率 … 时长 … 音量 …」/「停止播放音频」
+                「麦克风响度」/「麦克风检测 开/关」
+            音频占用的引脚会从 Scratch 的数字/模拟引脚里自动排除。
+            换板子时只要把下面的引脚改成实际接线, 不用动代码。
+            (板级描述文件里的 audio_dac / audio_adc 两个设备就是这里的 I2S + I2C + PA。)
+
+    config TMX_AUDIO_I2C_ADDR
+        hex "Codec 的 I2C 地址 (8 位写法)"
+        range 0x03 0xFE
+        default 0x30
+        help
+            ES8311 的 7 位地址是 0x18, 8 位写法是 0x30。
+            板级配置里 audio_dac/audio_adc 的 i2c_master address 就是 0x30。
+            这条 I2C 总线与 Scratch 的 I2C 积木共用 (引脚见上面「引脚」菜单)。
+
+    config TMX_AUDIO_I2S_MCLK_PIN
+        int "I2S MCLK 引脚"
+        range 0 48
+        default 38
+
+    config TMX_AUDIO_I2S_BCLK_PIN
+        int "I2S BCLK (SCLK) 引脚"
+        range 0 48
+        default 14
+
+    config TMX_AUDIO_I2S_WS_PIN
+        int "I2S WS (LRCK) 引脚"
+        range 0 48
+        default 13
+
+    config TMX_AUDIO_I2S_DOUT_PIN
+        int "I2S DOUT (板子 -> codec) 引脚"
+        range 0 48
+        default 45
+
+    config TMX_AUDIO_I2S_DIN_PIN
+        int "I2S DIN (codec -> 板子) 引脚"
+        range 0 48
+        default 12
+
+    config TMX_AUDIO_PA_PIN
+        int "功放 (PA) 使能引脚"
+        range 0 48
+        default 47
+
+    config TMX_AUDIO_PA_ACTIVE_LEVEL
+        int "PA 有效电平 (1=高电平开, 0=低电平开)"
+        range 0 1
+        default 1
+
+    config TMX_AUDIO_PA_GAIN_DB
+        int "PA 增益 (dB, 按功放电路填写)"
+        range 0 40
+        default 6
+        help
+            板级配置里 gpio_pa_control 的 gain: 6。只用于按音量百分比换算实际
+            输出增益, 填错不会损坏硬件, 只是音量刻度不准。
+
+    config TMX_AUDIO_SAMPLE_RATE
+        int "采样率 (Hz)"
+        range 8000 96000
+        default 48000
+
+    config TMX_AUDIO_MCLK_MULTIPLE
+        int "MCLK = 采样率 × N"
+        range 128 512
+        default 256
+
+    config TMX_AUDIO_VOLUME
+        int "默认音量 (%)"
+        range 0 100
+        default 80
+
+    config TMX_AUDIO_MIC_GAIN_DB
+        int "麦克风增益 (dB)"
+        range 0 42
+        default 30
+
+    config TMX_AUDIO_ADC_DAC_REF
+        bool "录音同时回采一路 DAC 输出 (ADCL + DACR)"
+        default y
+        help
+            ES8311 REG44/ADCDAT_SEL: 打开时右声道是播放回采 (RE)、左声道是
+            麦克风 (FC), 对应板级配置 adc_channel_labels: [RE, FC]。
+            只要麦克风就把它关掉 (两路都是麦克风)。
+
+    config TMX_AUDIO_MIC_CHANNEL
+        int "麦克风在哪个声道 (0=左, 1=右)"
+        range 0 1
+        default 0
+        help
+            上面的回采打开时, 左声道是麦克风。如果「麦克风响度」跟着喇叭里
+            播放的声音跑、反而不跟环境声跑, 把它改成 1。
+
+    config TMX_AUDIO_MIC_REPORT_MS
+        int "麦克风响度上报间隔 (毫秒)"
+        range 20 2000
+        default 100
+        help
+            只在响度变化时才发给 Scratch, 所以这个间隔是"最快多久发一次"。
+
+endmenu
+
+menu "语音合成 (TTS, esp-sr esp-tts)"
+
+    config TMX_TTS_ENABLE
+        bool "启用中文语音合成 (板子把文字念出来)"
+        default y
+        help
+            用 Espressif 的 esp-tts: 板子本地把中文文字合成语音, 从 ES8311 喇叭放出来。
+            音色数据 (xiaole, 2.9MB) 烧在 flash 的 voice_data 分区, 运行时 mmap,
+            不占 RAM 也不进 app 镜像 —— 所以本工程用 16MB flash + 自定义分区表
+            (partitions_16m.csv, 见 menuconfig -> Partition Table)。
+            Scratch 侧的积木: 「朗读文字 …」/「停止朗读」。
+
+    config TMX_TTS_SPEED
+        int "默认语速 (0 最慢 ~ 5 最快)"
+        range 0 5
+        default 4
+
+    config TMX_TTS_VOLUME
+        int "朗读音量 (%)"
+        range 0 100
+        default 90
+        help
+            朗读时把 ES8311 的输出音量设成这个值 (放音调用的是音频菜单里的音量)。
+
+    config TMX_TTS_TEXT_MAX
+        int "单次朗读文字上限 (字节, UTF-8)"
+        range 64 1024
+        default 512
+        help
+            一个汉字的 UTF-8 是 3 字节, 512 字节约 170 个汉字。
+            PC 端 (网关) 会把长文字拆成多个包发过来, 板子拼起来再念。
+
+    config TMX_TTS_PARTITION
+        string "音色数据所在分区名"
+        default "voice_data"
+        help
+            要与 partitions_16m.csv 里的分区名一致; 烧录时 idf.py flash 会把
+            esp-sr 自带的 esp_tts_voice_data_xiaole.dat 写进这个分区。
+
+    config TMX_TTS_MIRROR_MAX_KB
+        int "回传 PCM 的缓冲上限 (KB)"
+        range 1 32
+        default 8
+        help
+            「把合成的语音也回传一份给 PC」时用的环形缓冲。
+            PC 侧 tools/pc_tts_check.py 用它把板子念的话存成 wav 试听/验证。
+
+endmenu
+
+menu "摄像头 (OV2640 DVP)"
+
+    config TMX_CAMERA_ENABLE
+        bool "启用 OV2640 摄像头"
+        default y
+        help
+            板载 OV2640 是 DVP 并口摄像头 (8 位数据 + PCLK/VSYNC/HREF + XCLK),
+            控制口 (SCCB) 复用板载 I2C 总线 (和 ES8311 音频 codec 同一条线)。
+            驱动用 Espressif 的 esp32-camera 组件 (见 main/idf_component.yml)。
+
+            打开后:
+              - 上电初始化摄像头, 串口打印 "OV2640 ready: ..." 和传感器 PID;
+              - 摄像头占用的引脚会从 Scratch 的数字/模拟引脚池里排除;
+              - XCLK 由 LEDC 输出, 会占 1 个 LEDC 定时器 + 1 个通道,
+                Scratch 的 PWM/舵机可用路数相应减少 (见 docs/camera-ov2640.md)。
+
+            关掉后该模块完全不占资源, 引脚还给 Scratch。
+            拍照命令 / 上报见 docs/protocol.md 的 0x78~0x7B 与 0x0F~0x12。
+
+    menu "DVP 引脚 (本板接线, 改板子时按实际接线填)"
+
+        config TMX_CAMERA_XCLK_PIN
+            int "XCLK (IO8_DVP_XCLK)"
+            range 0 48
+            default 8
+
+        config TMX_CAMERA_PCLK_PIN
+            int "PCLK (IO16_DVP_PCLK)"
+            range 0 48
+            default 16
+
+        config TMX_CAMERA_VSYNC_PIN
+            int "VSYNC (IO3_DVP_VSYNC)"
+            range 0 48
+            default 3
+            help
+                GPIO3 是 ESP32-S3 的 Strapping 脚, 这里当输入用没问题
+                (它只在上电瞬间被采样, 摄像头驱动不会拿它当输出)。
+
+        config TMX_CAMERA_HREF_PIN
+            int "HREF (IO46_DVP_HREF)"
+            range 0 48
+            default 46
+            help
+                GPIO46 也是 Strapping 脚 (和 GPIO45 一起决定 ROM 日志/启动模式),
+                作为 HREF 输入使用同样没问题。
+
+        config TMX_CAMERA_PWDN_PIN
+            int "PWDN (IO48_DVP_PWDN, -1 = 未接)"
+            range -1 48
+            default 48
+
+        config TMX_CAMERA_RESET_PIN
+            int "RESET (未接时填 -1)"
+            range -1 48
+            default -1
+
+        config TMX_CAMERA_SIOD_PIN
+            int "SIOD / SCCB SDA (IO1_I2C_SDA)"
+            range 0 48
+            default 1
+            help
+                摄像头控制口。本板它和音频 codec 共用板载 I2C 总线
+                (SDA=GPIO1 / SCL=GPIO2), 所以默认值就是板载 I2C 的引脚,
+                驱动会直接挂到那条总线上, 不会再建一条。
+
+        config TMX_CAMERA_SIOC_PIN
+            int "SIOC / SCCB SCL (IO2_I2C_SCL)"
+            range 0 48
+            default 2
+
+        config TMX_CAMERA_D0_PIN
+            int "D0 (IO7_DVP_D0)"
+            range 0 48
+            default 7
+
+        config TMX_CAMERA_D1_PIN
+            int "D1 (IO5_DVP_D1)"
+            range 0 48
+            default 5
+
+        config TMX_CAMERA_D2_PIN
+            int "D2 (IO4_DVP_D2)"
+            range 0 48
+            default 4
+
+        config TMX_CAMERA_D3_PIN
+            int "D3 (IO6_DVP_D3)"
+            range 0 48
+            default 6
+
+        config TMX_CAMERA_D4_PIN
+            int "D4 (IO15_DVP_D4)"
+            range 0 48
+            default 15
+
+        config TMX_CAMERA_D5_PIN
+            int "D5 (IO17_DVP_D5)"
+            range 0 48
+            default 17
+
+        config TMX_CAMERA_D6_PIN
+            int "D6 (IO18_DVP_D6)"
+            range 0 48
+            default 18
+
+        config TMX_CAMERA_D7_PIN
+            int "D7 (IO9_DVP_D7)"
+            range 0 48
+            default 9
+
+    endmenu
+
+    config TMX_CAMERA_XCLK_FREQ_HZ
+            int "XCLK 频率 (Hz)"
+            range 10000000 24000000
+            default 24000000
+        help
+            OV2640 一般用 20MHz。画面有横条纹/花屏时可以试着降到 10~16MHz
+            (排线长的时候更稳), 帧率会跟着降。
+
+    config TMX_CAMERA_XCLK_LEDC_TIMER
+        int "XCLK 使用的 LEDC 定时器 (0~2)"
+        range 0 2
+        default 1
+        help
+            定时器 3 固定给舵机 (50Hz/14bit), 所以这里只能选 0~2。
+            LCD 背光打开 PWM 时占的是定时器 2, 默认给 XCLK 用定时器 1,
+            这样两边不打架 (冲突时编译会直接报错提示)。
+            选中的定时器会从 Scratch 的 PWM 池里让出来。
+
+    config TMX_CAMERA_XCLK_LEDC_CHANNEL
+        int "XCLK 使用的 LEDC 通道 (0~7)"
+        range 0 7
+        default 6
+        help
+            LCD 背光 PWM 默认占通道 7, 所以 XCLK 默认用通道 6。
+            选中的通道会从 Scratch 的 PWM/舵机池里让出来。
+
+    choice TMX_CAMERA_FRAMESIZE
+        prompt "默认分辨率"
+        default TMX_CAMERA_FRAMESIZE_VGA
+        help
+            本板没开 PSRAM, 帧缓冲在内部 DRAM: JPEG 缓冲大小约 宽x高/5,
+            VGA 约 61KB/份, QVGA 约 15KB/份。内存紧张就往小改,
+            也可以用 CAMERA_CONFIG 命令在线改 (不用重新编译)。
+
+        config TMX_CAMERA_FRAMESIZE_QVGA
+            bool "QVGA 320x240 (最省内存)"
+        config TMX_CAMERA_FRAMESIZE_VGA
+            bool "VGA 640x480 (默认)"
+        config TMX_CAMERA_FRAMESIZE_SVGA
+            bool "SVGA 800x600"
+        config TMX_CAMERA_FRAMESIZE_XGA
+            bool "XGA 1024x768"
+        config TMX_CAMERA_FRAMESIZE_SXGA
+            bool "SXGA 1280x1024 (吃内存)"
+        config TMX_CAMERA_FRAMESIZE_UXGA
+            bool "UXGA 1600x1200 (2MP 全尺寸, 很吃内存)"
+    endchoice
+
+    config TMX_CAMERA_JPEG_QUALITY
+        int "JPEG 质量 (0~63, 越小越清晰)"
+        range 0 63
+        default 20
+
+    config TMX_CAMERA_FB_COUNT
+        int "帧缓冲数量 (1~3)"
+        range 1 3
+        default 1
+        help
+            本板没开 PSRAM, 帧缓冲和 DMA 缓冲都在内部 RAM, 所以默认 1 份
+            (VGA 约 61KB 帧缓冲 + 32KB DMA 缓冲)。
+            想要更流畅 (驱动后台持续出帧) 可以改成 2, 但要多占一份帧缓冲;
+            初始化日志里出现 "frame buffer malloc failed" 就是内存不够, 改回 1。
+
+    config TMX_CAMERA_STREAM_INTERVAL_MS
+        int "连续拍默认间隔 (毫秒)"
+        range 0 5000
+        default 200
+        help
+            连续拍模式下两帧之间的间隔, 200ms 约 5fps。
+            PC 侧可以在 CAMERA_SNAPSHOT 命令里自己指定间隔, 这里只是默认值。
+
+    config TMX_CAMERA_PMIC_AXP2101
+        bool "开机自动打开 AXP2101 的摄像头供电 (BLDO1=AVDD / BLDO2=DVDD)"
+        default y
+        help
+            本板 OV2640 的 AVDD/DVDD 由 AXP2101 的 BLDO1/BLDO2 供电。
+            芯片上电默认只开 BLDO1 (0x90 = 0x55), DVDD 那一路是关的, 于是:
+
+              - SCCB 还能认出 0x30 (I/O 有电), 但传感器内部逻辑没上电;
+              - 寄存器写会 NACK / 读回错值, esp_camera_init 报
+                "Camera probe failed with error 0xffffffff(ESP_FAIL)";
+              - 板子重新上电以后摄像头就再也起不来了, 只有 PC 侧手动
+                tools/axp2101_power.py --on 打开才行。
+
+            打开这个选项后, 固件在初始化摄像头之前把 0x90 的 bit4/bit5
+            都置 1 (只动使能位, 不改电压; 电压沿用芯片默认值/板子当前值,
+            要改成 AVDD 2.8V / DVDD 1.2V 用 tools/axp2101_power.py)。
+            关掉后固件完全不碰 PMIC。
+
+    config TMX_CAMERA_PIN_PROBE
+        bool "启动时量一遍 DVP 各根信号线的活动 (排障用)"
+        default n
+        help
+            摄像头初始化完之后, 依次采样 XCLK/PCLK/VSYNC/HREF/D0~D7 的电平,
+            打印"在采样窗口里变化了多少次"。用来快速区分:
+
+              VSYNC 应该几乎不变 (一帧才跳一次);
+              HREF 会不停地变 (每行一次);
+              PCLK 变化次数最多 (每个像素一次);
+              谁都不变 -> 那根线没信号 (没接 / 接错 / XCLK 没到传感器)。
+
+            典型故障: 日志刷 "EV-VSYNC-OVF" + "NO-SOI", 而探针显示
+            VSYNC 那根线在疯狂变化 -> 同步线接反了 (VSYNC 和 HREF 互换),
+            把这两个引脚在 menuconfig 里对调即可。
+
+        config TMX_CAMERA_GAIN_CEILING
+            int "自动增益上限 (0=2X 1=4X 2=8X 3=16X 4=32X 5=64X 6=128X)"
+            range 0 6
+            default 3
+            help
+                OV2640 的自动增益在上限内往上加, 弱光下会一直加到最大 -> 画面全是噪点。
+                把这个上限压小 (比如 2 = 8X), 自动曝光会自动把曝光时间拉长补偿, 画面会
+                暗一些但干净很多。默认 3 = 16X。想要原厂行为就填 6 (128X)。
+
+endmenu

@@ -1,0 +1,22 @@
+# ESP-IDF 构建产物
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/dependencies.lock
+firmware/managed_components/
+
+# 本地参考源码（上游 s3-extend / Telemetrix4Esp32 / telemetrix-esp32 快照）
+.reference/
+
+# 编译日志
+*.log
+
+# 调试时拍下来的测试图 (tools/*.jpg) 和临时数据
+tools/*.jpg
+tools/*.bin
+tools/*.raw
+.tmp_session.txt
+
+# Python
+__pycache__/
+*.pyc

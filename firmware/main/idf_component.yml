@@ -1,0 +1,12 @@
+## IDF Component Manager Manifest File
+##
+## ILI9341 SPI 屏幕驱动 (esp_lcd_panel_io_spi + ILI9341 panel)，
+## 组件管理器会在 build 时自动下载到 managed_components/ 目录。
+dependencies:
+  espressif/esp_lcd_ili9341: "==1.2.0"
+  # ES8311 音频 codec 驱动 (I2C 控制 + I2S 数据), 见 main/tmx_audio.c
+  espressif/esp_codec_dev: "^1.5.0"
+  # OV2640 DVP 摄像头驱动 (DVP 数据线 + SCCB 复用板载 I2C), 见 main/tmx_camera.c
+  espressif/esp32-camera: "==2.1.7"
+  # 中文语音合成 (esp-tts), 见 main/tmx_tts.c; 音色数据 xiaole 烧在 voice_data 分区
+  espressif/esp-sr: "==2.4.4"

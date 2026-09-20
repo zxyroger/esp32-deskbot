@@ -1,0 +1,11 @@
+# 分区表 (16MB Flash)
+#
+# 为什么不用默认的单应用分区表: 板载 ES8311 的语音合成 (esp-sr esp-tts) 需要
+# 2.9MB 的中文音色数据 (esp_tts_voice_data_xiaole.dat), 它放在 voice_data 分区,
+# 运行时 mmap 出来给 TTS 用, 不占 RAM 也不进 app 镜像。
+#
+# Name,       Type, SubType, Offset,  Size,  Flags
+nvs,          data, nvs,     ,        0x6000,
+phy_init,     data, phy,     ,        0x1000,
+factory,      app,  factory, ,        4M,
+voice_data,   data, fat,     ,        3M,
