@@ -8,6 +8,11 @@
 完整改好的文件见同目录的 `cam_hal.c.local`。相对上游有两处改动，都在
 `cam_take()` 里 "Check for JPEG SOI in the first buffer" 那段（DRAM 分支）：
 
+> 协议说明：上游 `espressif/esp32-camera` 是 **Apache-2.0**（原文件头保留在
+> `cam_hal.c.local` 里），本文件属于"修改版"，按 Apache-2.0 §4(b) 在文件头加了
+> NOTICE 声明；本仓库整体协议见根目录 `LICENSE`（AGPL-3.0）与
+> `docs/THIRD_PARTY_NOTICES.md`。
+
 1. **不要因为"SOI 不在第 0 字节"就丢帧停止采集。**
    上游代码在 `soi_off != 0` 时执行：
 

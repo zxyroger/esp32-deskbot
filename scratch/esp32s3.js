@@ -1,4 +1,13 @@
-﻿/**
+/*
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ *
+ * 本文件改自 MrYsLab 的 OneGPIO / s3onegpio Scratch 扩展 (上游项目及其协议见
+ * docs/THIRD_PARTY_NOTICES.md)。上游同一套工具链 (s3-extend / Telemetrix4Esp32 /
+ * telemetrix-esp32) 使用 AGPL-3.0, 因此本文件与整个仓库都按 AGPL-3.0 发布。
+ *
+ * 本仓库改动部分: Copyright (c) 2026 zxyroger
+ */
+/**
  * ESP32-S3 (s3-extend / OneGPIO) Scratch 3 扩展
  *
  * 与上游 s3onegpio 的 OneGpio ESP32 扩展等价，但做了两处修正：

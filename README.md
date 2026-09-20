@@ -608,3 +608,23 @@ flash 用 16MB + 自定义分区表 `firmware/partitions_16m.csv`（语音合成
 * 中文语音合成（TTS）实测通过：`pc_tts_check.py` 让板子念
   “你好，我是小乐，很高兴认识你”→ 回传 113184 字节 / 3.54 秒 PCM（丢包 0）；
   走 Scratch 通道（Banyan → esp32gw → 0x75）也实测能念
+## 开源协议
+
+本工程整体按 **AGPL-3.0**（GNU Affero General Public License v3.0）发布，完整条文见 [LICENSE](LICENSE)。
+
+为什么是 AGPL-3.0：上游 MrYsLab 的工具链 [s3-extend](https://github.com/MrYsLab/s3-extend)、
+[Telemetrix4Esp32](https://github.com/MrYsLab/Telemetrix4Esp32)、
+[telemetrix-esp32](https://github.com/MrYsLab/telemetrix-esp32) 都是 **AGPL-3.0**；
+本仓库的 Scratch 扩展 [scratch/esp32s3.js](scratch/esp32s3.js) 改自 MrYsLab 的 OneGPIO 扩展
+（文件头有注明），`tools/` 里也有脚本会 import / 打补丁到这些包。
+固件里的 Telemetrix 协议实现是照协议**独立重写**的 C 代码（协议本身不受版权保护）。
+
+* **第三方清单**（上游项目、打包进仓库的第三方文件、组件管理器引用的组件及其协议）见
+  [docs/THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md)；
+* `firmware/patches/cam_hal.c.local` 来自 Espressif 的 `esp32-camera`（**Apache-2.0**，已修改，
+  文件头有 NOTICE 声明，见 [firmware/patches/README.md](firmware/patches/README.md)）；
+* 组件管理器引用的组件不在仓库里（构建时下载）：`esp32-camera` / `esp_codec_dev` /
+  `esp_lcd_ili9341` / `esp_jpeg` / `esp-dsp` 是 Apache-2.0，`cJSON` 是 MIT，
+  `esp-sr`（中文 TTS）是 Espressif MIT；
+* AGPL 第 13 条（网络条款）：把这套服务提供给网络用户使用时，需要向他们提供对应源码 ——
+  本仓库公开在 GitHub 上，满足这一条。

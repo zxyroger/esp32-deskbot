@@ -12,6 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// ---------------------------------------------------------------------------
+// NOTICE: THIS FILE HAS BEEN MODIFIED (Apache-2.0, section 4(b)).
+//
+// Modified by zxyroger for the onegpio ESP32-S3 scratch server, 2026-09-20/21:
+//   1. In cam_take(), the DRAM-path JPEG SOI check no longer throws the frame
+//      away when the start marker is not at byte 0 (the three upstream lines
+//      are wrapped in `#if 0`). The frame is handed to the application, which
+//      locates FF D8 FF / FF D9 itself (firmware/main/tmx_camera.c,
+//      jpeg_align_frame()).
+//   2. A throttled 16-byte hex dump of the frame start was added next to that
+//      check (prints "cam_hal: DBG-SOI / DBG-HDR", first 5 frames only).
+// Search for "local debug patch" below for the exact spots.
+//
+// Original file: espressif/esp32-camera 2.x, driver/cam_hal.c
+// See firmware/patches/README.md and docs/THIRD_PARTY_NOTICES.md.
+// ---------------------------------------------------------------------------
+
 #include <stdio.h>
 #include <string.h>
 #include <stdalign.h>
