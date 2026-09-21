@@ -16,6 +16,7 @@
 #include "tmx_camera.h"
 
 #include <string.h>
+#include <stdarg.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -285,6 +286,7 @@ static int                s_size_index;
 #include "driver/pulse_cnt.h"
 #include "driver/gpio.h"
 #include "esp_rom_gpio.h"
+#include "rom/ets_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "soc/gpio_sig_map.h"
@@ -293,6 +295,21 @@ static int                s_size_index;
 #include "soc/gpio_struct.h"
 #include "soc/io_mux_reg.h"
 #include "soc/rtc_io_reg.h"
+
+/*
+ * 探针输出走 ets_printf (直写控制台), 不走 ESP_LOG。
+ * 原因: 板子的日志通道开机一段时间后会卡住 (见 docs/camera-debug-notes.md),
+ * 而 ets_printf 一直有效 —— 这样运行中触发探针也能看到结果。
+ */
+static void probe_printf(const char *fmt, ...)
+{
+    char buf[192];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    ets_printf("%s", buf);
+}
 
 static void cam_probe_pin(const char *name, int pin, int window_ms, int glitch_ns)
 {
@@ -363,6 +380,9 @@ static void cam_probe_pin(const char *name, int pin, int window_ms, int glitch_n
 
     /* 删单元时驱动可能把引脚输入关了, 恢复成普通输入 */
     gpio_set_direction(pin, GPIO_MODE_INPUT);
+    probe_printf("PROBE %s IO%d edges=%d/%dms = %dHz\n",
+                 name, pin, edges, window_ms,
+                 (int)((int64_t)edges * 1000 / window_ms));
 
     ESP_LOGW(TAG, "探针 %-5s (IO%-2d): %7d 沿/%-4dms = %8d Hz  %s [%s]",
              name, pin, edges, window_ms,
@@ -463,6 +483,8 @@ static void cam_probe_data_pin(int index, int pin)
     const char *pull = cam_pull_verdict(pin);
     int ms = 0;
     int edges = cam_count_edges_until(pin, 1000, 800, &ms);
+
+    probe_printf("PROBE D%d IO%d edges=%d/%dms  %s\n", index, pin, edges, ms, pull);
 
     if (edges <= 0) {
         ESP_LOGW(TAG, "D%d (IO%-2d): %d 沿 / %4d ms  [%s]  <- 这一段时间完全没信号",
@@ -683,6 +705,13 @@ static void cam_probe_all_pins(void)
     cam_dump_pin_owner("PCLK", CONFIG_TMX_CAMERA_PCLK_PIN);
     cam_dump_pin_owner("D5", CONFIG_TMX_CAMERA_D5_PIN);
     cam_probe_pin("PCLK", CONFIG_TMX_CAMERA_PCLK_PIN, 1, 0);
+    /* PCLK 稳定性: 连量 5 次, 看有没有跳变/丢边沿 */
+    probe_printf("PROBE PCLK_x5:");
+    for (int i = 0; i < 5; i++) {
+        int e = cam_count_edges(CONFIG_TMX_CAMERA_PCLK_PIN, 1, 0);
+        probe_printf(" %d", e);
+    }
+    probe_printf("  (每格 1ms)\n");
     cam_probe_pin("VSYNC", CONFIG_TMX_CAMERA_VSYNC_PIN, 200, 1000);
     cam_probe_pin("HREF", CONFIG_TMX_CAMERA_HREF_PIN, 20, 1000);
     cam_probe_data_pin(0, CONFIG_TMX_CAMERA_D0_PIN);
