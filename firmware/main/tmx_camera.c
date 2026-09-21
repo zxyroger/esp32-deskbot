@@ -217,6 +217,38 @@ static tmx_camera_send_fn s_send;
 static camera_config_t    s_cfg;            /* 自检失败要重新初始化时用 */
 static bool               s_sensor_on;      /* 传感器现在是不是开着 (开着就发热) */
 
+/* 在线调过的传感器参数 (0x7D)。-1 = 用传感器自己的默认值。
+ * 因为空闲断电, 每次拍照前都会重新初始化, 所以这些值必须在 init 之后重新套用,
+ * 否则调完下一张就丢 (之前"0x7D 没生效"就是这个原因)。 */
+static int                s_tune_gainceiling = CONFIG_TMX_CAMERA_GAIN_CEILING;
+static int                s_tune_brightness  = -1;
+static int                s_tune_contrast    = -1;
+static int                s_tune_saturation  = -1;
+static int                s_tune_ae_level    = -1;
+
+static void apply_tuned_settings(sensor_t *sensor)
+{
+    if (sensor == NULL) {
+        return;
+    }
+    sensor->set_gainceiling(sensor, (gainceiling_t)s_tune_gainceiling);
+    if (s_tune_brightness >= 0) {
+        sensor->set_brightness(sensor, s_tune_brightness);
+    }
+    if (s_tune_contrast >= 0) {
+        sensor->set_contrast(sensor, s_tune_contrast);
+    }
+    if (s_tune_saturation >= 0) {
+        sensor->set_saturation(sensor, s_tune_saturation);
+    }
+    if (s_tune_ae_level >= 0) {
+        sensor->set_ae_level(sensor, s_tune_ae_level);
+    }
+    ESP_LOGI(TAG, "传感器参数: 增益上限 %d, 亮度 %d, 对比 %d, 饱和 %d, AE档 %d (-1=默认)",
+             s_tune_gainceiling, s_tune_brightness, s_tune_contrast,
+             s_tune_saturation, s_tune_ae_level);
+}
+
 static bool frame_header_ok(const camera_fb_t *fb);
 
 static camera_fb_t       *s_fb;             /* 正在发给 PC 的那一帧 */
@@ -936,12 +968,9 @@ esp_err_t tmx_camera_init(void)
         sensor = esp_camera_sensor_get();
     }
 
-    /* 弱光降噪: 压住自动增益上限, 让 AEC 用曝光时间(而不是增益)去补偿。
-     * 上限越小噪点越少、画面越暗; 想要原厂行为把 Kconfig 填 6 (128X)。 */
-    if (sensor != NULL) {
-        sensor->set_gainceiling(sensor, (gainceiling_t)CONFIG_TMX_CAMERA_GAIN_CEILING);
-        ESP_LOGI(TAG, "自动增益上限设为 %d (0=2X 3=16X 6=128X)", CONFIG_TMX_CAMERA_GAIN_CEILING);
-    }
+    /* 弱光降噪: 压住自动增益上限, 让 AEC 用曝光时间(而不是增益)去补偿;
+     * 同时把在线调过的参数重新套一遍 (空闲断电会重置传感器)。 */
+    apply_tuned_settings(sensor);
 
 #if CONFIG_TMX_CAMERA_PIN_PROBE
     cam_probe_all_pins();
@@ -1095,10 +1124,15 @@ esp_err_t tmx_camera_tune(int field, int value)
     int ret = 0;
     switch (field) {
     case TMX_CAM_FIELD_STATUS:     log_sensor_status(); return ESP_OK;
-    case TMX_CAM_FIELD_BRIGHTNESS: ret = sensor->set_brightness(sensor, value); break;
-    case TMX_CAM_FIELD_CONTRAST:   ret = sensor->set_contrast(sensor, value); break;
-    case TMX_CAM_FIELD_SATURATION: ret = sensor->set_saturation(sensor, value); break;
-    case TMX_CAM_FIELD_AE_LEVEL:   ret = sensor->set_ae_level(sensor, value); break;
+    /* 这几个值要记住: 空闲断电后每次拍照都会重新初始化, 不重新套用就丢了 */
+    case TMX_CAM_FIELD_BRIGHTNESS: ret = sensor->set_brightness(sensor, value);
+                                   if (ret == 0) { s_tune_brightness = value; } break;
+    case TMX_CAM_FIELD_CONTRAST:   ret = sensor->set_contrast(sensor, value);
+                                   if (ret == 0) { s_tune_contrast = value; } break;
+    case TMX_CAM_FIELD_SATURATION: ret = sensor->set_saturation(sensor, value);
+                                   if (ret == 0) { s_tune_saturation = value; } break;
+    case TMX_CAM_FIELD_AE_LEVEL:   ret = sensor->set_ae_level(sensor, value);
+                                   if (ret == 0) { s_tune_ae_level = value; } break;
     case TMX_CAM_FIELD_AGC_GAIN:   ret = sensor->set_agc_gain(sensor, value); break;
     case TMX_CAM_FIELD_AEC_VALUE:  ret = sensor->set_aec_value(sensor, value); break;
     case TMX_CAM_FIELD_GAINCEILING:/* 0=2X 1=4X 2=8X 3=16X 4=32X 5=64X 6=128X */
@@ -1107,6 +1141,9 @@ esp_err_t tmx_camera_tune(int field, int value)
             return ESP_ERR_INVALID_ARG;
         }
         ret = sensor->set_gainceiling(sensor, (gainceiling_t)value);
+        if (ret == 0) {
+            s_tune_gainceiling = value;
+        }
         break;
     case TMX_CAM_FIELD_HMIRROR:    ret = sensor->set_hmirror(sensor, value); break;
     case TMX_CAM_FIELD_VFLIP:      ret = sensor->set_vflip(sensor, value); break;
