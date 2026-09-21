@@ -231,3 +231,30 @@ python D:\esp\onegpio\tools\pc_camera_check.py 192.168.0.106 --view       # 拍�
 2. **在线调参命令 (0x7D) 没生效**: `pc_camera_tune.py` 发出的命令板子没反应
    (vflip/增益上限都不变), 有待用 `CONFIG_TMX_DEBUG_REPORTS` 逐条确认包有没有进
    到命令分发里。
+
+## 摄像头发烫 (2026-09-21): 供电电压 + 空闲断电
+
+摸上去很烫, 查出来是两件事:
+
+1. **供电电压之前被留在 `2.8V / 2.8V`**: OV2640 的 DVDD 是 **1.2V 内核供电**,
+   挂在 2.8V 上属于过压, 会明显发热 (时间长了也可能伤到传感器)。之前调试供电映射时
+   为了做对照实验把 BLDO2 抬到 2.8V, 之后一直没改回来。
+   固件现在**每次开机都把两路设成确定值**并打开:
+
+   | Kconfig | 默认 | 接到 |
+   | --- | --- | --- |
+   | `TMX_CAMERA_PMIC_AVDD_MV` | 2800 | AVDD = BLDO1 |
+   | `TMX_CAMERA_PMIC_DVDD_MV` | **1200** | DVDD = BLDO2 |
+
+   开机日志会打: `PMIC: 摄像头供电 AVDD(BLDO1)=2800mV, DVDD(BLDO2)=1200mV`。
+
+2. **初始化完就一直出流**: esp32-camera 一旦 init, 传感器就不停出图 (XCLK 一直跑,
+   JPEG 编码器一直干活), 摸上去当然是温的。固件现在 `TMX_CAMERA_IDLE_POWER_OFF=y`
+   (默认开):
+
+   * 开机只做一次初始化自检, 随后**断电** (停 XCLK + PWDN 拉高);
+   * 每次拍照前重新上电初始化 (~0.3s, 含一次 JPEG 头自检), 拍完 (或 CAMERA_STOP) 立刻断电;
+   * 空闲时 SCCB 上 `0x30` 不应答, 模块是凉的 (用 `tools/ov2640_regs.py` 可以验证)。
+
+   另外自检失败时, 重试现在会做一次**真正的掉电再上电** (PWDN 拉高 150ms 再拉低),
+   因为只调 `esp_camera_init()` 清不掉"采样错位"那个状态。

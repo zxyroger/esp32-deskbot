@@ -59,6 +59,8 @@ OV2640 是 **0x30**, ES8311 是 **0x18** (8 位写法 0x60 / 0x30)。
 | `TMX_CAMERA_JPEG_QUALITY`（默认由 12 调成 20） | 20 | 0~63，越小越清晰、帧越大；VGA 用质量 12 时帧可到 100KB，配 100KB 缓冲取 20 更稳 |
 | `TMX_CAMERA_XCLK_FREQ_HZ`（默认由 20MHz 调成 24MHz） | 24000000 | **重要**：ESP32 的 OV2640 寄存器表是按 24MHz 调的。20MHz/10MHz 实测画面全是噪点、JPEG 头里的 DHT/SOF 标记字节被采错（`C4→C5`/`C0→C1`），一半的帧无法解码；24MHz 下全部正常 |
 | `TMX_CAMERA_GAIN_CEILING` | 3 | 自动增益上限（0=2X … 3=16X … 6=128X）。弱光下压小它噪点更少（画面偏暗），自动曝光会拉长曝光补偿；想要原厂行为填 6。开机还会自动做一次 JPEG 头自检，发现问题就重新初始化传感器 |
+| `TMX_CAMERA_IDLE_POWER_OFF` | y | 空闲时给摄像头断电降温：开机自检后立刻停 XCLK+PWDN 掉电，拍照前重新上电初始化（约 +0.3s），拍完再断电 |
+| `TMX_CAMERA_PMIC_AVDD_MV` / `TMX_CAMERA_PMIC_DVDD_MV` | 2800 / **1200** | 每次开机把 AXP2101 的 AVDD(BLDO1) / DVDD(BLDO2) 设成这个值并打开。**DVDD 别填 2.8V**：那是 1.2V 内核供电，过压会让模块明显发烫 |
 | `TMX_CAMERA_PMIC_AXP2101` | y | 开机先把 AXP2101 的 BLDO1(AVDD)/BLDO2(DVDD) 打开 (本板摄像头供电, 只动使能位不改电压)；关掉就完全不动 PMIC |
 | `TMX_CAMERA_PIN_PROBE` | n | 启动时量一遍 DVP 各根线的活动 (PCNT 硬件计数) 并扫一遍空闲 GPIO；2026-09-20 的排查结论见 [camera-debug-notes.md](camera-debug-notes.md) |
 | `TMX_CAMERA_JPEG_QUALITY` | 12 | 0~63, 越小越清晰 (码流越大) |

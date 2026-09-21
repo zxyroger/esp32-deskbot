@@ -649,7 +649,7 @@ menu "摄像头 (OV2640 DVP)"
             VSYNC 那根线在疯狂变化 -> 同步线接反了 (VSYNC 和 HREF 互换),
             把这两个引脚在 menuconfig 里对调即可。
 
-        config TMX_CAMERA_GAIN_CEILING
+    config TMX_CAMERA_GAIN_CEILING
             int "自动增益上限 (0=2X 1=4X 2=8X 3=16X 4=32X 5=64X 6=128X)"
             range 0 6
             default 3
@@ -657,5 +657,35 @@ menu "摄像头 (OV2640 DVP)"
                 OV2640 的自动增益在上限内往上加, 弱光下会一直加到最大 -> 画面全是噪点。
                 把这个上限压小 (比如 2 = 8X), 自动曝光会自动把曝光时间拉长补偿, 画面会
                 暗一些但干净很多。默认 3 = 16X。想要原厂行为就填 6 (128X)。
+
+        config TMX_CAMERA_IDLE_POWER_OFF
+            bool "空闲时给摄像头断电 (拍照前再上电, 防止发烫)"
+            default y
+            help
+                OV2640 一旦被初始化就会一直出流 (XCLK 不停、JPEG 编码器一直干活),
+                摸上去很烫。打开这个选项后:
+
+                  - 开机只做一次初始化自检, 随后就断电 (停 XCLK + PWDN 拉高);
+                  - 收到拍照命令时重新上电初始化 (含一次 JPEG 头自检), 再开始拍;
+                  - 拍完 (或 CAMERA_STOP) 立刻断电。
+
+                代价是每次拍照前多花 ~0.3 秒初始化。关掉它就退回"一直开着"的老行为。
+
+        config TMX_CAMERA_PMIC_AVDD_MV
+            int "PMIC: 摄像头 AVDD (BLDO1) 电压 mV"
+            range 500 3500
+            default 2800
+            help
+                OV2640 的 AVDD(模拟) 典型 2.8V, 由 AXP2101 的 BLDO1 供电。
+                固件每次开机会把这一路设成这个电压并打开, 免得芯片默认值 (1.8V)
+                或者调试时手动改的电压残留下来。
+
+        config TMX_CAMERA_PMIC_DVDD_MV
+            int "PMIC: 摄像头 DVDD (BLDO2) 电压 mV"
+            range 500 3500
+            default 1200
+            help
+                OV2640 的 DVDD(数字内核) 典型 1.2V, 由 AXP2101 的 BLDO2 供电。
+                **别填 2.8V**: 内核过压会让摄像头明显发烫 (甚至损坏)。
 
 endmenu

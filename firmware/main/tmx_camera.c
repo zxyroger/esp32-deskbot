@@ -51,6 +51,31 @@ static const char *TAG = "tmx_camera";
 #define TMX_PMIC_ID_AXP2101    0x4A
 #define TMX_PMIC_BLDO1_BIT     4     /* BLDO1 = AVDD */
 #define TMX_PMIC_BLDO2_BIT     5     /* BLDO2 = DVDD */
+#define TMX_PMIC_REG_BLDO1_VOL 0x96  /* BLDO1 电压 = 500mV + N*100mV */
+#define TMX_PMIC_REG_BLDO2_VOL 0x97  /* BLDO2 电压 = 同上 */
+
+/* 设一路 BLDO 的电压 (寄存器低 5 位 = (mV-500)/100) */
+static bool pmic_set_ldo_mv(uint8_t vol_reg, int millivolt)
+{
+    if (millivolt < 500 || millivolt > 3500 || ((millivolt - 500) % 100) != 0) {
+        ESP_LOGW(TAG, "PMIC: 电压 %d mV 非法 (500~3500mV, 100mV 一档)", millivolt);
+        return false;
+    }
+    uint8_t cur = 0;
+    size_t len = 0;
+    if (tmx_i2c_read(TMX_PMIC_ADDR, vol_reg, 1, false, &cur, sizeof(cur), &len) != ESP_OK ||
+        len != 1) {
+        ESP_LOGW(TAG, "PMIC: 读电压寄存器 0x%02X 失败", vol_reg);
+        return false;
+    }
+    uint8_t val = (uint8_t)((cur & 0xE0) | ((millivolt - 500) / 100));
+    uint8_t buf[2] = { vol_reg, val };
+    if (tmx_i2c_write(TMX_PMIC_ADDR, buf, sizeof(buf)) != ESP_OK) {
+        ESP_LOGW(TAG, "PMIC: 写电压寄存器 0x%02X 失败", vol_reg);
+        return false;
+    }
+    return true;
+}
 
 static void camera_power_on(void)
 {
@@ -63,6 +88,15 @@ static void camera_power_on(void)
         ESP_LOGW(TAG, "PMIC: 0x%02X 上的 AXP2101 没应答 (0x%02X 读回 0x%02X), 跳过摄像头供电",
                  TMX_PMIC_ADDR, TMX_PMIC_REG_ID, value);
         return;
+    }
+
+    /* 电压每次开机都设成确定值: AVDD 2.8V / DVDD 1.2V (OV2640 数据手册, Kconfig 可调)。
+     * DVDD 填大了 (比如 2.8V) 内核过压, 摄像头会明显发烫。 */
+    bool vol_ok = pmic_set_ldo_mv(TMX_PMIC_REG_BLDO1_VOL, CONFIG_TMX_CAMERA_PMIC_AVDD_MV);
+    vol_ok &= pmic_set_ldo_mv(TMX_PMIC_REG_BLDO2_VOL, CONFIG_TMX_CAMERA_PMIC_DVDD_MV);
+    if (vol_ok) {
+        ESP_LOGI(TAG, "PMIC: 摄像头供电 AVDD(BLDO1)=%dmV, DVDD(BLDO2)=%dmV",
+                 CONFIG_TMX_CAMERA_PMIC_AVDD_MV, CONFIG_TMX_CAMERA_PMIC_DVDD_MV);
     }
 
     if (tmx_i2c_read(TMX_PMIC_ADDR, TMX_PMIC_REG_LDO_EN0, 1, false,
@@ -145,6 +179,7 @@ static const char *s_frame_names[] = {
 static bool               s_ready;
 static tmx_camera_send_fn s_send;
 static camera_config_t    s_cfg;            /* 自检失败要重新初始化时用 */
+static bool               s_sensor_on;      /* 传感器现在是不是开着 (开着就发热) */
 
 static bool frame_header_ok(const camera_fb_t *fb);
 
@@ -703,10 +738,40 @@ static void drop_current_frame(void)
 /* 初始化                                                              */
 /* ------------------------------------------------------------------ */
 
+/*
+ * 给摄像头断电 (降温)。
+ *
+ * OV2640 只要初始化过就会一直出流: XCLK 不停、JPEG 编码器一直干活, 摸上去很烫。
+ * 所以拍完就把 esp_camera 反初始化 (XCLK 停) 并且把 PWDN 拉高 (传感器掉电),
+ * 下次拍照前再上电初始化。Kconfig TMX_CAMERA_IDLE_POWER_OFF 可以关掉这个行为。
+ */
+static void camera_sensor_off(void)
+{
+    if (!CONFIG_TMX_CAMERA_IDLE_POWER_OFF || !s_sensor_on) {
+        return;
+    }
+
+    esp_camera_deinit();
+    s_sensor_on = false;
+
+    if (CONFIG_TMX_CAMERA_PWDN_PIN >= 0) {
+        gpio_config_t io_cfg = {
+            .pin_bit_mask = 1ULL << CONFIG_TMX_CAMERA_PWDN_PIN,
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_cfg);
+        gpio_set_level(CONFIG_TMX_CAMERA_PWDN_PIN, 1);   /* PWDN: 1 = 掉电 (与 RESET 反相) */
+    }
+    ESP_LOGI(TAG, "空闲降温: 摄像头已断电 (PWDN=1, XCLK 停), 下次拍照前重新初始化");
+}
+
 esp_err_t tmx_camera_init(void)
 {
-    if (s_ready) {
-        return ESP_OK;
+    if (s_ready && s_sensor_on) {
+        return ESP_OK;          /* 已经开着 */
     }
 
     /* SCCB 走板载 I2C 总线: 音频那一侧可能已经建好了, 没有就按摄像头引脚建 */
@@ -719,8 +784,11 @@ esp_err_t tmx_camera_init(void)
         }
     }
 
-    s_size_index = CAM_DEFAULT_SIZE;
-    s_quality = CONFIG_TMX_CAMERA_JPEG_QUALITY;
+    if (!s_ready) {             /* 只在第一次初始化时套用 Kconfig 默认值;
+                                 * 之后重新上电要保留在线改过的分辨率/质量 */
+        s_size_index = CAM_DEFAULT_SIZE;
+        s_quality = CONFIG_TMX_CAMERA_JPEG_QUALITY;
+    }
 
     /* 冷启动时 AXP2101 只开了 AVDD, DVDD 是关的 -> SCCB 读写会时好时坏 */
     camera_power_on();
@@ -783,6 +851,7 @@ esp_err_t tmx_camera_init(void)
 
     sensor_t *sensor = esp_camera_sensor_get();
     s_ready = true;
+    s_sensor_on = true;
     s_cfg = cfg;
 
     /* 开机自检: 抓一帧看看 JPEG 头好不好。这块板子偶尔会碰上"初始化少写进去
@@ -800,7 +869,16 @@ esp_err_t tmx_camera_init(void)
         }
         ESP_LOGW(TAG, "开机自检: 第 %d 帧 JPEG 头不对 (采样错位), 重新初始化摄像头", attempt);
         esp_camera_deinit();
-        vTaskDelay(pdMS_TO_TICKS(200));
+        /* 光重新 init 不够: 传感器内部状态没复位。把 PWDN 拉高做一次真正的掉电再上电,
+         * 这样"采样错位"的状态才能清掉 (实测有效)。 */
+        if (CONFIG_TMX_CAMERA_PWDN_PIN >= 0) {
+            gpio_set_level(CONFIG_TMX_CAMERA_PWDN_PIN, 1);      /* 掉电 */
+            vTaskDelay(pdMS_TO_TICKS(150));
+            gpio_set_level(CONFIG_TMX_CAMERA_PWDN_PIN, 0);      /* 上电 */
+            vTaskDelay(pdMS_TO_TICKS(20));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
         if (esp_camera_init(&s_cfg) != ESP_OK) {
             ESP_LOGE(TAG, "重新初始化摄像头失败, 拍照功能不可用");
             s_ready = false;
@@ -836,6 +914,9 @@ esp_err_t tmx_camera_init(void)
              CONFIG_TMX_CAMERA_D6_PIN, CONFIG_TMX_CAMERA_D7_PIN,
              CONFIG_TMX_CAMERA_PWDN_PIN,
              CONFIG_TMX_CAMERA_SIOD_PIN, CONFIG_TMX_CAMERA_SIOC_PIN);
+
+    /* 开机验完就断电: 平时不拍照时板子上的摄像头应该是凉的 */
+    camera_sensor_off();
     return ESP_OK;
 }
 
@@ -857,6 +938,21 @@ esp_err_t tmx_camera_set_format(int frame_size, int quality, int pixformat)
 {
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_sensor_on) {
+        /* 空闲时传感器是断电的: 只记下新设置, 下次拍照上电时生效 */
+        if (frame_size >= 0) {
+            if (frame_size >= CAM_SIZE_COUNT) {
+                return ESP_ERR_INVALID_ARG;
+            }
+            s_size_index = frame_size;
+        }
+        if (quality >= 0) {
+            s_quality = quality > 63 ? 63 : quality;
+        }
+        ESP_LOGI(TAG, "摄像头空闲, 已记下设置: %s 质量 %d (下次拍照生效)",
+                 s_frame_names[s_size_index], s_quality);
+        return ESP_OK;
     }
     sensor_t *sensor = sensor_or_null();
     if (sensor == NULL) {
@@ -1036,6 +1132,9 @@ int tmx_camera_state(void)
     if (!s_ready) {
         return TMX_CAMERA_STATE_ERROR;
     }
+    if (!s_sensor_on) {
+        return TMX_CAMERA_STATE_IDLE;      /* 空闲断电状态 */
+    }
     return (s_fb != NULL || s_frames_left != 0) ? TMX_CAMERA_STATE_STREAM
                                                 : TMX_CAMERA_STATE_IDLE;
 }
@@ -1061,6 +1160,10 @@ void tmx_camera_send_info(void)
     if (sensor != NULL) {
         width = resolution[sensor->status.framesize].width;
         height = resolution[sensor->status.framesize].height;
+    } else {
+        /* 空闲时传感器是断电的, 按配置值上报 */
+        width = resolution[s_frame_sizes[s_size_index]].width;
+        height = resolution[s_frame_sizes[s_size_index]].height;
     }
 
     /* 数据: 状态(1) 宽(2) 高(2) 质量(1) 分辨率索引(1) XCLK MHz(1) */
@@ -1084,6 +1187,14 @@ esp_err_t tmx_camera_snapshot(int frames, uint32_t interval_ms)
     if (!s_ready) {
         ESP_LOGW(TAG, "摄像头没就绪, 忽略拍照请求");
         return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_sensor_on) {
+        /* 空闲时摄像头是断电的 (降温), 拍之前重新上电初始化 */
+        esp_err_t err = tmx_camera_init();
+        if (err != ESP_OK || !s_sensor_on) {
+            ESP_LOGW(TAG, "拍照前给摄像头上电失败: %s", esp_err_to_name(err));
+            return (err == ESP_OK) ? ESP_FAIL : err;
+        }
     }
     if (interval_ms > 10000) {
         interval_ms = 10000;
@@ -1285,6 +1396,9 @@ void tmx_camera_poll(void)
     if (!s_ready || s_send == NULL) {
         return;
     }
+    if (!s_sensor_on) {
+        return;                 /* 空闲断电状态, 等拍照命令再上电 */
+    }
 
     if (s_fb != NULL) {
         send_frame_chunks();
@@ -1292,6 +1406,8 @@ void tmx_camera_poll(void)
     }
 
     if (s_frames_left == 0) {
+        /* 拍完/停止后把摄像头断电降温 (下次拍照前会重新初始化) */
+        camera_sensor_off();
         return;
     }
 
