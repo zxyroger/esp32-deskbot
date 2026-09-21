@@ -680,7 +680,19 @@ menu "摄像头 (OV2640 DVP)"
                 固件每次开机会把这一路设成这个电压并打开, 免得芯片默认值 (1.8V)
                 或者调试时手动改的电压残留下来。
 
-        config TMX_CAMERA_PMIC_DVDD_MV
+    config TMX_CAMERA_PMIC_ALDO2_MV
+        int "PMIC: 摄像头 VDDCAM_3V3 (ALDO2) 电压 mV"
+        range 1700 3300
+        default 2800
+        help
+            本板摄像头的 I/O 供电 (VDDCAM_3V3) 接在 AXP2101 的 ALDO2 上。
+            这一路**默认是关的** (0x90 的 bit1 = 0): 关着的时候 DVP 数据线的
+            高电平由 I/O 漏电决定 (实测只有 1.8V), 低于 ESP32-S3 的判高门限,
+            于是帧数据全是错的 (SCCB 因为开漏+上拉还能通, 只是拍不出图)。
+            固件开机会把这一路设成这个电压并打开。
+            OV2640 的 I/O 规格是 1.7~3.3V, 2.8V 最稳。
+
+    config TMX_CAMERA_PMIC_DVDD_MV
             int "PMIC: 摄像头 DVDD (BLDO2) 电压 mV"
             range 500 3500
             default 1200

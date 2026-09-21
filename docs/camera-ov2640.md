@@ -61,6 +61,7 @@ OV2640 是 **0x30**, ES8311 是 **0x18** (8 位写法 0x60 / 0x30)。
 | `TMX_CAMERA_GAIN_CEILING` | 3 | 自动增益上限（0=2X … 3=16X … 6=128X）。弱光下压小它噪点更少（画面偏暗），自动曝光会拉长曝光补偿；想要原厂行为填 6。开机还会自动做一次 JPEG 头自检，发现问题就重新初始化传感器 |
 | `TMX_CAMERA_IDLE_POWER_OFF` | y | 空闲时给摄像头断电降温：开机自检后立刻停 XCLK+PWDN 掉电，拍照前重新上电初始化（约 +0.3s），拍完再断电 |
 | `TMX_CAMERA_PMIC_AVDD_MV` / `TMX_CAMERA_PMIC_DVDD_MV` | 2800 / **1200** | 每次开机把 AXP2101 的 AVDD(BLDO1) / DVDD(BLDO2) 设成这个值并打开。**DVDD 别填 2.8V**：那是 1.2V 内核供电，过压会让模块明显发烫 |
+| `TMX_CAMERA_PMIC_ALDO2_MV` | 2800 | 摄像头 I/O 供电 VDDCAM_3V3 接在 AXP2101 的 **ALDO2** 上，芯片默认是**关的**。不打开时 DVP 高电平只有漏电电压（实测 1.8V），低于 ESP32 判高门限 → 帧数据全乱、拍不出图（SCCB 因为开漏上拉仍能通，很容易误判成模组坏了）。固件开机会把它设成这个电压并打开 |
 | `TMX_CAMERA_PMIC_AXP2101` | y | 开机先把 AXP2101 的 BLDO1(AVDD)/BLDO2(DVDD) 打开 (本板摄像头供电, 只动使能位不改电压)；关掉就完全不动 PMIC |
 | `TMX_CAMERA_PIN_PROBE` | n | 启动时量一遍 DVP 各根线的活动 (PCNT 硬件计数) 并扫一遍空闲 GPIO；2026-09-20 的排查结论见 [camera-debug-notes.md](camera-debug-notes.md) |
 | `TMX_CAMERA_JPEG_QUALITY` | 12 | 0~63, 越小越清晰 (码流越大) |

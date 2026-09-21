@@ -224,6 +224,37 @@ python D:\esp\onegpio\tools\pc_camera_check.py 192.168.0.106 --view       # 拍�
 * 想恢复原厂: 填 6 (128X);
 * 改完要重新编译烧录 (在线调参的 `pc_camera_tune.py` 目前还没打通, 见下)。
 
+## 真正的病根找到了: VDDCAM_3V3(ALDO2) 一直是关的 (2026-09-21 深夜)
+
+拿万用表量三路电压时发现: AVDD=2.8V ✓、DVDD=1.2V ✓、**VDDCAM_3V3 只有 1.8V** ✗。
+按板子确认, VDDCAM_3V3 接的是 **AXP2101 的 ALDO2**, 而它的使能位 (`0x90` bit1)
+**从开机起就是 0** —— 量到的 1.8V 是 I/O 漏电把悬空的轨抬起来的假电压。
+也就是说摄像头的 **I/O 供电一直是断的**:
+
+* DVP 数据线的高电平只有 1.8V, 低于 ESP32-S3 的判高门限 (~2.5V) → 数据被读得
+  时好时坏, 表现就是帧头找不到 `FF D8`、字节成对重复;
+* SCCB 照样能通, 因为 I2C 是开漏 + 上拉, 不吃这个门限 —— 所以之前一直误判成
+  "传感器采样错位 / 模组被过压弄坏了"。
+
+修法: 固件开机会把 ALDO2 (=VDDCAM_3V3) 设成 `TMX_CAMERA_PMIC_ALDO2_MV`
+(默认 **2800mV**) 并打开; 自检失败做掉电重来时也把它一起关掉再上电。
+
+改完实测 (VGA):
+
+```
+I tmx_camera: PMIC: 摄像头供电 AVDD(BLDO1)=2800mV, DVDD(BLDO2)=1200mV, VDDCAM(ALDO2)=2800mV
+I tmx_camera: PMIC AXP2101: LDO 使能 0x90 = 0x77 ...
+I tmx_camera: 开机自检: 第 1 帧 JPEG 头正常
+I tmx_camera: OV2640 ready: VGA 640x480, JPEG 质量 20, XCLK 24MHz, fb=1, PID=0x26
+第 1/2/3 帧: 640x480, 能被 Pillow 正常解码
+```
+
+同时这一轮也把"空闲断电"修好了: 拍照前那次重新初始化不再被误判成失败
+(之前 `tmx_camera_init()` 末尾总会断电, 拍照路径看到 `s_sensor_on=false` 就以为上电失败)。
+
+**更正前几节的推测**: 模组没有坏, "采样错位"是 I/O 供电缺失造成的, 不是过压损伤。
+(DVDD 挂 2.8V 确实会让它发烫, 那条已经改回 1.2V。)
+
 ## 还没解决的
 
 1. **串口日志开机后一段时间会停**: USB-Serial-JTAG 的日志通道会卡住 (TCP 命令

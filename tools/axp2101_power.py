@@ -57,6 +57,38 @@ LDO_NAMES = ["ALDO1", "ALDO2", "ALDO3", "ALDO4", "BLDO1(AVDD)", "BLDO2(DVDD)"]
 VOL_REGS = {0x92: "ALDO1", 0x93: "ALDO2", 0x94: "ALDO3", 0x95: "ALDO4",
             REG_BLDO1_VOL: "BLDO1(AVDD)", REG_BLDO2_VOL: "BLDO2(DVDD)"}
 
+# 通用 LDO 表: 名字 -> (电压寄存器, 0x90 里的使能位)
+# 主要给"板子上 VDDCAM_3V3 到底挂在哪一路"这种排查用
+LDO_TABLE = {
+    "ALDO1": (0x92, 0), "ALDO2": (0x93, 1), "ALDO3": (0x94, 2), "ALDO4": (0x95, 3),
+    "BLDO1": (REG_BLDO1_VOL, BLDO1_BIT), "BLDO2": (REG_BLDO2_VOL, BLDO2_BIT),
+    "AVDD": (REG_BLDO1_VOL, BLDO1_BIT), "DVDD": (REG_BLDO2_VOL, BLDO2_BIT),
+}
+
+
+def set_one_ldo(client, name, value):
+    """--set <LDO> <mV|off>: 设电压并打开, 或关掉"""
+    key = name.upper()
+    if key not in LDO_TABLE:
+        print("不认识的 LDO: %s (可用: %s)" % (name, ", ".join(sorted(LDO_TABLE))))
+        return False
+    vol_reg, bit = LDO_TABLE[key]
+    if str(value).lower() in ("off", "0", "disable", "关"):
+        return enable_ldo(client, key, bit, False)
+    mv = int(str(value), 0)
+    if mv < 100:                      # 允许写 0 表示关掉
+        return enable_ldo(client, key, bit, False)
+    raw = read_reg(client, vol_reg)
+    if raw is None:
+        print("%s: 读 0x%02X 失败" % (key, vol_reg))
+        return False
+    target = (raw[0] & 0xE0) | ((mv - 500) // 100 & 0x1F)
+    if not write_reg(client, vol_reg, target):
+        print("%s: 写 0x%02X 失败" % (key, vol_reg))
+        return False
+    print("%s: 电压设为 %d mV (0x%02X = 0x%02X)" % (key, mv, vol_reg, target))
+    return enable_ldo(client, key, bit, True)
+
 
 def read_reg(client, reg, count=1, timeout=1.0):
     """读 AXP2101 的寄存器; 失败返回 None"""
@@ -180,6 +212,8 @@ def main():
     parser.add_argument("--dvdd", type=int, default=1200, help="DVDD 电压 mV (默认 1200)")
     parser.add_argument("--reset", action="store_true",
                         help="做完之后复位板子 (让固件重新初始化摄像头)")
+    parser.add_argument("--set", nargs=2, action="append", metavar=("LDO", "mV|off"),
+                        help="直接设某一路 LDO: --set ALDO1 2800 / --set ALDO3 off (可重复)")
     parser.add_argument("--delay", type=float, default=0.3,
                         help="上电后等多久再继续 (秒, 默认 0.3)")
     args = parser.parse_args()
@@ -198,6 +232,14 @@ def main():
         print("--- 当前状态 ---")
         if not show_status(client):
             return 2
+
+        if args.set:
+            print("--- 手动设置 LDO ---")
+            for ldo_name, ldo_value in args.set:
+                set_one_ldo(client, ldo_name, ldo_value)
+            time.sleep(args.delay)
+            print("--- 设置后 ---")
+            show_status(client)
 
         if args.on or args.off:
             print("--- 修改 ---")

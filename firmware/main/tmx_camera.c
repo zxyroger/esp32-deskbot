@@ -53,6 +53,8 @@ static const char *TAG = "tmx_camera";
 #define TMX_PMIC_BLDO2_BIT     5     /* BLDO2 = DVDD */
 #define TMX_PMIC_REG_BLDO1_VOL 0x96  /* BLDO1 电压 = 500mV + N*100mV */
 #define TMX_PMIC_REG_BLDO2_VOL 0x97  /* BLDO2 电压 = 同上 */
+#define TMX_PMIC_REG_ALDO2_VOL 0x93  /* ALDO2 = 摄像头 I/O 供电 VDDCAM_3V3 */
+#define TMX_PMIC_ALDO2_BIT     1     /* 0x90 里 ALDO2 的使能位 */
 
 /* 设一路 BLDO 的电压 (寄存器低 5 位 = (mV-500)/100) */
 static bool pmic_set_ldo_mv(uint8_t vol_reg, int millivolt)
@@ -87,7 +89,8 @@ static void camera_rails_off(void)
         return;
     }
     uint8_t target = (uint8_t)(value & ~((1u << TMX_PMIC_BLDO1_BIT) |
-                                         (1u << TMX_PMIC_BLDO2_BIT)));
+                                         (1u << TMX_PMIC_BLDO2_BIT) |
+                                         (1u << TMX_PMIC_ALDO2_BIT)));
     uint8_t buf[2] = { TMX_PMIC_REG_LDO_EN0, target };
     if (tmx_i2c_write(TMX_PMIC_ADDR, buf, sizeof(buf)) != ESP_OK) {
         ESP_LOGW(TAG, "PMIC: 关摄像头供电失败");
@@ -111,9 +114,25 @@ static void camera_power_on(void)
      * DVDD 填大了 (比如 2.8V) 内核过压, 摄像头会明显发烫。 */
     bool vol_ok = pmic_set_ldo_mv(TMX_PMIC_REG_BLDO1_VOL, CONFIG_TMX_CAMERA_PMIC_AVDD_MV);
     vol_ok &= pmic_set_ldo_mv(TMX_PMIC_REG_BLDO2_VOL, CONFIG_TMX_CAMERA_PMIC_DVDD_MV);
+    /* 摄像头 I/O 供电 VDDCAM_3V3 挂在 ALDO2 上, 芯片默认是关的 —— 必须打开,
+     * 否则 DVP 高电平只有漏电电压 (~1.8V), 低于 ESP32 判高门限, 帧数据全乱。 */
+    vol_ok &= pmic_set_ldo_mv(TMX_PMIC_REG_ALDO2_VOL, CONFIG_TMX_CAMERA_PMIC_ALDO2_MV);
     if (vol_ok) {
-        ESP_LOGI(TAG, "PMIC: 摄像头供电 AVDD(BLDO1)=%dmV, DVDD(BLDO2)=%dmV",
-                 CONFIG_TMX_CAMERA_PMIC_AVDD_MV, CONFIG_TMX_CAMERA_PMIC_DVDD_MV);
+        ESP_LOGI(TAG, "PMIC: 摄像头供电 AVDD(BLDO1)=%dmV, DVDD(BLDO2)=%dmV, VDDCAM(ALDO2)=%dmV",
+                 CONFIG_TMX_CAMERA_PMIC_AVDD_MV, CONFIG_TMX_CAMERA_PMIC_DVDD_MV,
+                 CONFIG_TMX_CAMERA_PMIC_ALDO2_MV);
+    }
+
+    /* 打开 ALDO2 (bit1); BLDO1/BLDO2 的 bit4/bit5 下面一起置 1 */
+    if (tmx_i2c_read(TMX_PMIC_ADDR, TMX_PMIC_REG_LDO_EN0, 1, false, &value, sizeof(value), &len) == ESP_OK &&
+        len == 1) {
+        uint8_t with_aldo2 = (uint8_t)(value | (1u << TMX_PMIC_ALDO2_BIT));
+        if (with_aldo2 != value) {
+            uint8_t buf2[2] = { TMX_PMIC_REG_LDO_EN0, with_aldo2 };
+            if (tmx_i2c_write(TMX_PMIC_ADDR, buf2, sizeof(buf2)) == ESP_OK) {
+                value = with_aldo2;
+            }
+        }
     }
 
     if (tmx_i2c_read(TMX_PMIC_ADDR, TMX_PMIC_REG_LDO_EN0, 1, false,
@@ -794,6 +813,9 @@ esp_err_t tmx_camera_init(void)
     if (s_ready && s_sensor_on) {
         return ESP_OK;          /* 已经开着 */
     }
+    /* 只有开机那一次初始化结束后才顺手断电降温;
+     * 拍照前重新上电的这次调用必须把传感器留在"开"的状态。 */
+    bool first_time = !s_ready;
 
     /* SCCB 走板载 I2C 总线: 音频那一侧可能已经建好了, 没有就按摄像头引脚建 */
     if (!tmx_i2c_is_ready()) {
@@ -943,7 +965,9 @@ esp_err_t tmx_camera_init(void)
              CONFIG_TMX_CAMERA_SIOD_PIN, CONFIG_TMX_CAMERA_SIOC_PIN);
 
     /* 开机验完就断电: 平时不拍照时板子上的摄像头应该是凉的 */
-    camera_sensor_off();
+    if (first_time) {
+        camera_sensor_off();
+    }
     return ESP_OK;
 }
 
@@ -1218,9 +1242,9 @@ esp_err_t tmx_camera_snapshot(int frames, uint32_t interval_ms)
     if (!s_sensor_on) {
         /* 空闲时摄像头是断电的 (降温), 拍之前重新上电初始化 */
         esp_err_t err = tmx_camera_init();
-        if (err != ESP_OK || !s_sensor_on) {
+        if (err != ESP_OK) {
             ESP_LOGW(TAG, "拍照前给摄像头上电失败: %s", esp_err_to_name(err));
-            return (err == ESP_OK) ? ESP_FAIL : err;
+            return err;
         }
     }
     if (interval_ms > 10000) {
