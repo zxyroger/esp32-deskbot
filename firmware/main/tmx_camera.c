@@ -77,6 +77,23 @@ static bool pmic_set_ldo_mv(uint8_t vol_reg, int millivolt)
     return true;
 }
 
+/* 把摄像头两路 LDO 关掉 (真正的掉电, 连 I/O 一起), 用于自检失败时的"硬复位" */
+static void camera_rails_off(void)
+{
+    uint8_t value = 0;
+    size_t len = 0;
+    if (tmx_i2c_read(TMX_PMIC_ADDR, TMX_PMIC_REG_LDO_EN0, 1, false,
+                     &value, sizeof(value), &len) != ESP_OK || len != 1) {
+        return;
+    }
+    uint8_t target = (uint8_t)(value & ~((1u << TMX_PMIC_BLDO1_BIT) |
+                                         (1u << TMX_PMIC_BLDO2_BIT)));
+    uint8_t buf[2] = { TMX_PMIC_REG_LDO_EN0, target };
+    if (tmx_i2c_write(TMX_PMIC_ADDR, buf, sizeof(buf)) != ESP_OK) {
+        ESP_LOGW(TAG, "PMIC: 关摄像头供电失败");
+    }
+}
+
 static void camera_power_on(void)
 {
     uint8_t value = 0;
@@ -747,7 +764,10 @@ static void drop_current_frame(void)
  */
 static void camera_sensor_off(void)
 {
-    if (!CONFIG_TMX_CAMERA_IDLE_POWER_OFF || !s_sensor_on) {
+#if !CONFIG_TMX_CAMERA_IDLE_POWER_OFF
+    return;
+#else
+    if (!s_sensor_on) {
         return;
     }
 
@@ -766,6 +786,7 @@ static void camera_sensor_off(void)
         gpio_set_level(CONFIG_TMX_CAMERA_PWDN_PIN, 1);   /* PWDN: 1 = 掉电 (与 RESET 反相) */
     }
     ESP_LOGI(TAG, "空闲降温: 摄像头已断电 (PWDN=1, XCLK 停), 下次拍照前重新初始化");
+#endif
 }
 
 esp_err_t tmx_camera_init(void)
@@ -873,12 +894,18 @@ esp_err_t tmx_camera_init(void)
          * 这样"采样错位"的状态才能清掉 (实测有效)。 */
         if (CONFIG_TMX_CAMERA_PWDN_PIN >= 0) {
             gpio_set_level(CONFIG_TMX_CAMERA_PWDN_PIN, 1);      /* 掉电 */
-            vTaskDelay(pdMS_TO_TICKS(150));
-            gpio_set_level(CONFIG_TMX_CAMERA_PWDN_PIN, 0);      /* 上电 */
-            vTaskDelay(pdMS_TO_TICKS(20));
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(200));
         }
+#if CONFIG_TMX_CAMERA_PMIC_AXP2101
+        camera_rails_off();                                     /* 连 AVDD/DVDD 一起断 */
+#endif
+        vTaskDelay(pdMS_TO_TICKS(200));
+#if CONFIG_TMX_CAMERA_PMIC_AXP2101
+        camera_power_on();                                      /* 重新设电压 + 打开 */
+#endif
+        if (CONFIG_TMX_CAMERA_PWDN_PIN >= 0) {
+            gpio_set_level(CONFIG_TMX_CAMERA_PWDN_PIN, 0);      /* 上电 */
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
         if (esp_camera_init(&s_cfg) != ESP_OK) {
             ESP_LOGE(TAG, "重新初始化摄像头失败, 拍照功能不可用");
             s_ready = false;
