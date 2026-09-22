@@ -58,6 +58,7 @@ OV2640 是 **0x30**, ES8311 是 **0x18** (8 位写法 0x60 / 0x30)。
 | `CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_CUSTOM` / `_SIZE` | y / 100000 | JPEG 帧缓冲大小；自动算法 `w*h/5` 只有 61KB，画面细节一多整帧就被判 `FB-OVF` 丢掉（组件菜单，不在本工程 Kconfig 里）|
 | `TMX_CAMERA_JPEG_QUALITY`（默认由 12 调成 20） | 20 | 0~63，越小越清晰、帧越大；VGA 用质量 12 时帧可到 100KB，配 100KB 缓冲取 20 更稳 |
 | `TMX_CAMERA_XCLK_FREQ_HZ`（默认由 20MHz 调成 24MHz） | 24000000 | **重要**：ESP32 的 OV2640 寄存器表是按 24MHz 调的。20MHz/10MHz 实测画面全是噪点、JPEG 头里的 DHT/SOF 标记字节被采错（`C4→C5`/`C0→C1`），一半的帧无法解码；24MHz 下全部正常 |
+| 夜间模式（在线切 XCLK） | 24MHz | 想要夜里横纹少一点，用 `python tools\pc_camera_tune.py <ip> --set xclk 12` 把 XCLK 降到 12MHz：帧率约减半、曝光时间上限翻倍，同样亮度下自动增益更低 → 逐行噪声更少（白天想恢复就 `--set xclk 24`）。重启后回到 Kconfig 默认值 |
 | `TMX_CAMERA_GAIN_CEILING` | 3 | 自动增益上限（0=2X … 3=16X … 6=128X）。弱光下压小它噪点更少（画面偏暗），自动曝光会拉长曝光补偿；想要原厂行为填 6。开机还会自动做一次 JPEG 头自检，发现问题就重新初始化传感器 |
 | `TMX_CAMERA_IDLE_POWER_OFF` | y | 空闲时给摄像头断电降温：开机自检后立刻停 XCLK+PWDN 掉电，拍照前重新上电初始化（约 +0.3s），拍完再断电 |
 | `TMX_CAMERA_PMIC_AVDD_MV` / `TMX_CAMERA_PMIC_DVDD_MV` | 2800 / **1200** | 每次开机把 AXP2101 的 AVDD(BLDO1) / DVDD(BLDO2) 设成这个值并打开。**DVDD 别填 2.8V**：那是 1.2V 内核供电，过压会让模块明显发烫 |

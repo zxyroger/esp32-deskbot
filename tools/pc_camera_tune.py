@@ -28,7 +28,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pc_tcp_check import TelemetrixClient  # noqa: E402
+from pc_tcp_check import TelemetrixClient, RPT_CAMERA_PROBE  # noqa: E402
 
 CMD_CAMERA_TUNE = 0x7D
 
@@ -51,6 +51,7 @@ FIELDS = {
     "set_reg_sen": 15,   # 值 = (寄存器<<8) | 新值, 直接写 sensor 档
     "get_reg": 16,       # 值 = (档<<8)|寄存器, 读一个寄存器 (看串口)
     "clr_extra": 17,     # 清空"额外寄存器"列表
+    "xclk": 18,          # XCLK 频率 MHz (8~24); 夜里调低 = 夜间模式
 }
 
 
@@ -84,8 +85,19 @@ def main():
         for field, value in todo:
             payload = [field & 0xFF, (value >> 8) & 0xFF, value & 0xFF]
             client.send(CMD_CAMERA_TUNE, *payload)
-            time.sleep(0.3)
             print("已发送: field=%d value=%d" % (field, value))
+            # 读寄存器 (field=16) 的结果通过 TCP 上报回来
+            deadline = time.time() + 1.5
+            while time.time() < deadline:
+                try:
+                    packet = client.read_packet()
+                except Exception:
+                    break
+                if packet is None:
+                    continue
+                if packet[0] == RPT_CAMERA_PROBE and len(packet) >= 4 and packet[1] == 0x40:
+                    regnum = (packet[2] << 8) | packet[3]
+                    print("  读回 0x%02X = 0x%02X" % ((regnum >> 8) & 0xFF, regnum & 0xFF))
     finally:
         client.close()
 

@@ -226,6 +226,7 @@ static int                s_tune_brightness  = -1;
 static int                s_tune_contrast    = -1;
 static int                s_tune_saturation  = -1;
 static int                s_tune_ae_level    = -1;
+static int                s_xclk_hz          = CONFIG_TMX_CAMERA_XCLK_FREQ_HZ;
 
 /* 0x7D 里直接写的"额外寄存器" (set_reg_dsp / set_reg_sen)。
  * 空闲断电后每次拍照都会重新初始化传感器, 所以这些也要记住并重新写一遍 ——
@@ -977,7 +978,7 @@ esp_err_t tmx_camera_init(void)
         .pin_href     = CONFIG_TMX_CAMERA_HREF_PIN,
         .pin_pclk     = CONFIG_TMX_CAMERA_PCLK_PIN,
 
-        .xclk_freq_hz = CONFIG_TMX_CAMERA_XCLK_FREQ_HZ,
+        .xclk_freq_hz = s_xclk_hz,      /* 可以在线改 (0x7D field=18), 夜间模式用低一点 */
         .ledc_timer   = (ledc_timer_t)CONFIG_TMX_CAMERA_XCLK_LEDC_TIMER,
         .ledc_channel = (ledc_channel_t)CONFIG_TMX_CAMERA_XCLK_LEDC_CHANNEL,
 
@@ -1203,6 +1204,14 @@ static void log_sensor_status(void)
 /* 在线调传感器参数 (协议 0x7D) */
 esp_err_t tmx_camera_tune(int field, int value)
 {
+    if (!s_sensor_on) {
+        /* 空闲时摄像头是断电的, 调参/读寄存器先把它叫起来 (调完主循环会再让它断电) */
+        esp_err_t err = tmx_camera_init();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "调参前给摄像头上电失败: %s", esp_err_to_name(err));
+            return err;
+        }
+    }
     sensor_t *sensor = sensor_or_null();
     if (sensor == NULL) {
         ESP_LOGW(TAG, "摄像头没就绪, 调不了");
@@ -1255,11 +1264,28 @@ esp_err_t tmx_camera_tune(int field, int value)
         s_extra_reg_count = 0;
         ESP_LOGW(TAG, "清空额外寄存器列表 (恢复默认)");
         return ESP_OK;
+    case TMX_CAM_FIELD_XCLK_MHZ:
+        /* 夜间模式: 降 XCLK -> 帧率跟着降 -> 自动曝光能用更长曝光时间, 同样亮度下
+         * 增益更低, 逐行噪声(横纹)更少。实测 24MHz->12MHz: 行间跳动 3.2 -> 1.4。
+         * 改完立刻重新初始化摄像头让它生效。 */
+        if (value < 8 || value > 24) {
+            ESP_LOGW(TAG, "XCLK %d MHz 超出范围 (8~24)", value);
+            return ESP_ERR_INVALID_ARG;
+        }
+        s_xclk_hz = value * 1000000;
+        camera_sensor_off();
+        if (tmx_camera_init() != ESP_OK) {
+            ESP_LOGW(TAG, "按新 XCLK 重新初始化失败");
+            return ESP_FAIL;
+        }
+        probe_report(0x30, value);      /* 回一条: 当前 XCLK MHz */
+        return ESP_OK;
     case TMX_CAM_FIELD_GET_REG: {
         int bank = (value >> 8) & 0x01;
         int reg = value & 0xFF;
         int got = sensor->get_reg(sensor, (bank << 8) | reg, 0xFF);
         ESP_LOGW(TAG, "读寄存器 bank%d[0x%02X] = 0x%02X", bank, reg, got & 0xFF);
+        probe_report(0x40, ((reg & 0xFF) << 8) | (got & 0xFF));   /* 读回值走 TCP */
         return ESP_OK;
     }
     default:
@@ -1354,7 +1380,7 @@ void tmx_camera_send_info(void)
         (uint8_t)(width >> 8), (uint8_t)(width & 0xff),
         (uint8_t)(height >> 8), (uint8_t)(height & 0xff),
         (uint8_t)s_quality, (uint8_t)s_size_index,
-        (uint8_t)(CONFIG_TMX_CAMERA_XCLK_FREQ_HZ / 1000000),
+        (uint8_t)(s_xclk_hz / 1000000),
     };
     s_send(packet, sizeof(packet));
 }
