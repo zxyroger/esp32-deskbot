@@ -227,6 +227,33 @@ static int                s_tune_contrast    = -1;
 static int                s_tune_saturation  = -1;
 static int                s_tune_ae_level    = -1;
 
+/* 0x7D 里直接写的"额外寄存器" (set_reg_dsp / set_reg_sen)。
+ * 空闲断电后每次拍照都会重新初始化传感器, 所以这些也要记住并重新写一遍 ——
+ * 用来做寄存器级实验 (比如降帧率的 CLKRC)。 */
+#define TMX_CAM_EXTRA_REGS_MAX 8
+static struct {
+    uint8_t bank;
+    uint8_t reg;
+    uint8_t val;
+} s_extra_regs[TMX_CAM_EXTRA_REGS_MAX];
+static int s_extra_reg_count;
+
+static void extra_reg_store(int bank, int reg, int val)
+{
+    for (int i = 0; i < s_extra_reg_count; i++) {
+        if (s_extra_regs[i].bank == bank && s_extra_regs[i].reg == reg) {
+            s_extra_regs[i].val = (uint8_t)val;
+            return;
+        }
+    }
+    if (s_extra_reg_count < TMX_CAM_EXTRA_REGS_MAX) {
+        s_extra_regs[s_extra_reg_count].bank = (uint8_t)bank;
+        s_extra_regs[s_extra_reg_count].reg = (uint8_t)reg;
+        s_extra_regs[s_extra_reg_count].val = (uint8_t)val;
+        s_extra_reg_count++;
+    }
+}
+
 static void apply_tuned_settings(sensor_t *sensor)
 {
     if (sensor == NULL) {
@@ -245,9 +272,17 @@ static void apply_tuned_settings(sensor_t *sensor)
     if (s_tune_ae_level >= 0) {
         sensor->set_ae_level(sensor, s_tune_ae_level);
     }
+    for (int i = 0; i < s_extra_reg_count; i++) {
+        sensor->set_reg(sensor,
+                        (s_extra_regs[i].bank << 8) | s_extra_regs[i].reg,
+                        0xFF, s_extra_regs[i].val);
+    }
     ESP_LOGI(TAG, "传感器参数: 增益上限 %d, 亮度 %d, 对比 %d, 饱和 %d, AE档 %d (-1=默认)",
              s_tune_gainceiling, s_tune_brightness, s_tune_contrast,
              s_tune_saturation, s_tune_ae_level);
+    if (s_extra_reg_count > 0) {
+        ESP_LOGI(TAG, "额外寄存器: %d 个 (set_reg_*) 已重新写入", s_extra_reg_count);
+    }
 }
 
 static bool frame_header_ok(const camera_fb_t *fb);
@@ -309,6 +344,23 @@ static void probe_printf(const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     ets_printf("%s", buf);
+}
+
+/* 探针结果也走 TCP 上报 (类型 + 边沿数): 串口日志通道不可靠, TCP 一定通。
+ * 类型: 0=PCLK 1=VSYNC 2=HREF 3~10=D0~D7 0x20=PCLK 连测 0x7F=结束 */
+static void probe_report(uint8_t kind, int value)
+{
+    if (s_send == NULL) {
+        return;
+    }
+    if (value < 0) {
+        value = 0;
+    }
+    uint8_t packet[5] = {
+        4, TMX_REPORT_CAMERA_PROBE, kind,
+        (uint8_t)((value >> 8) & 0xff), (uint8_t)(value & 0xff),
+    };
+    s_send(packet, sizeof(packet));
 }
 
 static void cam_probe_pin(const char *name, int pin, int window_ms, int glitch_ns)
@@ -383,6 +435,8 @@ static void cam_probe_pin(const char *name, int pin, int window_ms, int glitch_n
     probe_printf("PROBE %s IO%d edges=%d/%dms = %dHz\n",
                  name, pin, edges, window_ms,
                  (int)((int64_t)edges * 1000 / window_ms));
+    probe_report(strcmp(name, "PCLK") == 0 ? 0 :
+                 (strcmp(name, "VSYNC") == 0 ? 1 : 2), edges);
 
     ESP_LOGW(TAG, "探针 %-5s (IO%-2d): %7d 沿/%-4dms = %8d Hz  %s [%s]",
              name, pin, edges, window_ms,
@@ -485,6 +539,7 @@ static void cam_probe_data_pin(int index, int pin)
     int edges = cam_count_edges_until(pin, 1000, 800, &ms);
 
     probe_printf("PROBE D%d IO%d edges=%d/%dms  %s\n", index, pin, edges, ms, pull);
+    probe_report((uint8_t)(3 + index), edges);
 
     if (edges <= 0) {
         ESP_LOGW(TAG, "D%d (IO%-2d): %d 沿 / %4d ms  [%s]  <- 这一段时间完全没信号",
@@ -708,10 +763,13 @@ static void cam_probe_all_pins(void)
     /* PCLK 稳定性: 连量 5 次, 看有没有跳变/丢边沿 */
     probe_printf("PROBE PCLK_x5:");
     for (int i = 0; i < 5; i++) {
-        int e = cam_count_edges(CONFIG_TMX_CAMERA_PCLK_PIN, 1, 0);
-        probe_printf(" %d", e);
+        int ms = 0;
+        int e = cam_count_edges_until(CONFIG_TMX_CAMERA_PCLK_PIN, 5000, 200, &ms);
+        int khz = ms > 0 ? (int)((int64_t)e / ms) : 0;
+        probe_printf(" %dkHz", khz);
+        probe_report(0x20, khz);        /* 单位 kHz: 4500 表示 PCLK 4.5MHz */
     }
-    probe_printf("  (每格 1ms)\n");
+    probe_printf("  (PCLK 速率, kHz)\n");
     cam_probe_pin("VSYNC", CONFIG_TMX_CAMERA_VSYNC_PIN, 200, 1000);
     cam_probe_pin("HREF", CONFIG_TMX_CAMERA_HREF_PIN, 20, 1000);
     cam_probe_data_pin(0, CONFIG_TMX_CAMERA_D0_PIN);
@@ -723,6 +781,7 @@ static void cam_probe_all_pins(void)
     cam_probe_data_pin(6, CONFIG_TMX_CAMERA_D6_PIN);
     cam_probe_data_pin(7, CONFIG_TMX_CAMERA_D7_PIN);
     cam_probe_restore_pins();
+    probe_report(0x7F, 0);                 /* 结束标记 */
     LCD_CAM.lc_dma_int_ena.cam_vsync_int_ena = 1;
     ESP_LOGW(TAG, "=== 探针结束 ===");
 }
@@ -1187,10 +1246,15 @@ esp_err_t tmx_camera_tune(int field, int value)
         int val = value & 0xFF;
         ret = sensor->set_reg(sensor, (bank << 8) | reg, 0xFF, val);
         if (ret == 0) {
+            extra_reg_store(bank, reg, val);
             ESP_LOGW(TAG, "写寄存器 bank%d[0x%02X] = 0x%02X", bank, reg, val);
         }
         break;
     }
+    case TMX_CAM_FIELD_CLR_EXTRA:
+        s_extra_reg_count = 0;
+        ESP_LOGW(TAG, "清空额外寄存器列表 (恢复默认)");
+        return ESP_OK;
     case TMX_CAM_FIELD_GET_REG: {
         int bank = (value >> 8) & 0x01;
         int reg = value & 0xFF;

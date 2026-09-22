@@ -788,17 +788,24 @@ static void cmd_camera_info(void)
 
 static void cmd_camera_probe(void)
 {
+    esp_log_level_set("tmx_camera", ESP_LOG_NONE);   /* 同上, 先静音再探针 */
+    tmx_camera_send_info();                          /* 心跳: 让 PC 知道命令到了 */
     ESP_LOGW(TAG, "camera probe: 开始量 DVP 各信号线 (看串口后续几行)");
     tmx_camera_probe_pins();
 }
 
 static void cmd_camera_tune(void)
 {
+    /* 日志通道开机一段后会卡住, 而这两个命令一进来就写日志 —— 那会把命令处理
+     * 任务自己卡住, 探针/调参干脆跑不到。先把 tmx_camera 这个 tag 静音;
+     * 探针结果本身是 ets_printf 直连输出的, 不受影响。 */
+    esp_log_level_set("tmx_camera", ESP_LOG_NONE);
     int field = s_cmd_buffer[0];
     int value = (int)(int16_t)((s_cmd_buffer[1] << 8) | s_cmd_buffer[2]);
     if (tmx_camera_tune(field, value) != ESP_OK) {
         ESP_LOGW(TAG, "camera tune: field %d value %d failed", field, value);
     }
+    tmx_camera_send_info();                          /* 心跳: 让 PC 知道命令到了 */
 }
 
 static void warn_unsupported(uint8_t command)
