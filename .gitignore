@@ -23,3 +23,6 @@ __pycache__/
 
 # 分析/对比用的连拍图 (tools/pc_camera_stripe.py 的输入)
 tools/stripe/
+
+# 随手拍的样张 / 对比图
+tools/photos/
