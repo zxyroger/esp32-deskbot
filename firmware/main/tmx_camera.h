@@ -100,5 +100,9 @@ void tmx_camera_poll(void);
 #define TMX_CAM_FIELD_GET_REG     16  /* 读一个寄存器 (值 = (档<<8)|寄存器, 结果打串口) */
 #define TMX_CAM_FIELD_CLR_EXTRA   17  /* 清空"额外寄存器"列表 (set_reg_* 记下的那些) */
 #define TMX_CAM_FIELD_XCLK_MHZ    18  /* 直接改 XCLK 频率 (MHz, 8~24); 夜里调低 = 夜间模式 */
+#define TMX_CAM_FIELD_DENOISE     19  /* 传感器内置降噪 (0 关, 越大越强) */
+#define TMX_CAM_FIELD_SHARPNESS   20  /* 锐度 -2~2 (负值更平滑) */
+#define TMX_CAM_FIELD_BPC         21  /* 坏点校正 0/1 */
+#define TMX_CAM_FIELD_WPC         22  /* 白点校正 0/1 */
 
 esp_err_t tmx_camera_tune(int field, int value);

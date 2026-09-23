@@ -226,6 +226,10 @@ static int                s_tune_brightness  = -1;
 static int                s_tune_contrast    = -1;
 static int                s_tune_saturation  = -1;
 static int                s_tune_ae_level    = -1;
+static int                s_tune_denoise     = -1;
+static int                s_tune_sharpness   = -1;
+static int                s_tune_bpc         = -1;
+static int                s_tune_wpc         = -1;
 static int                s_xclk_hz          = CONFIG_TMX_CAMERA_XCLK_FREQ_HZ;
 
 /* 0x7D 里直接写的"额外寄存器" (set_reg_dsp / set_reg_sen)。
@@ -272,6 +276,18 @@ static void apply_tuned_settings(sensor_t *sensor)
     }
     if (s_tune_ae_level >= 0) {
         sensor->set_ae_level(sensor, s_tune_ae_level);
+    }
+    if (s_tune_denoise >= 0) {
+        sensor->set_denoise(sensor, s_tune_denoise);
+    }
+    if (s_tune_sharpness >= 0) {
+        sensor->set_sharpness(sensor, s_tune_sharpness);
+    }
+    if (s_tune_bpc >= 0) {
+        sensor->set_bpc(sensor, s_tune_bpc);
+    }
+    if (s_tune_wpc >= 0) {
+        sensor->set_wpc(sensor, s_tune_wpc);
     }
     for (int i = 0; i < s_extra_reg_count; i++) {
         sensor->set_reg(sensor,
@@ -1230,6 +1246,14 @@ esp_err_t tmx_camera_tune(int field, int value)
                                    if (ret == 0) { s_tune_saturation = value; } break;
     case TMX_CAM_FIELD_AE_LEVEL:   ret = sensor->set_ae_level(sensor, value);
                                    if (ret == 0) { s_tune_ae_level = value; } break;
+    case TMX_CAM_FIELD_DENOISE:    ret = sensor->set_denoise(sensor, value);
+                                   if (ret == 0) { s_tune_denoise = value; } break;
+    case TMX_CAM_FIELD_SHARPNESS:  ret = sensor->set_sharpness(sensor, value);
+                                   if (ret == 0) { s_tune_sharpness = value; } break;
+    case TMX_CAM_FIELD_BPC:        ret = sensor->set_bpc(sensor, value);
+                                   if (ret == 0) { s_tune_bpc = value; } break;
+    case TMX_CAM_FIELD_WPC:        ret = sensor->set_wpc(sensor, value);
+                                   if (ret == 0) { s_tune_wpc = value; } break;
     case TMX_CAM_FIELD_AGC_GAIN:   ret = sensor->set_agc_gain(sensor, value); break;
     case TMX_CAM_FIELD_AEC_VALUE:  ret = sensor->set_aec_value(sensor, value); break;
     case TMX_CAM_FIELD_GAINCEILING:/* 0=2X 1=4X 2=8X 3=16X 4=32X 5=64X 6=128X */
