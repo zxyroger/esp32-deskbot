@@ -435,3 +435,85 @@ python tools\pc_camera_merge.py --files tools\avgframe_*.jpg --out tools\merged.
 
 关键判据: **同一场景连拍多帧, 行条纹在多帧平均后应该按 1/√N 衰减** —— 衰减了就是随机
 行噪声(传感器), 不衰减就是固定图案(纹波/串扰/场景本身)。
+
+## 把摄像头接到 Scratch 积木 (2026-09-23 深夜)
+
+固件侧的协议 (0x78~0x7B / 上报 0x0F~0x12) 早就有了, 缺的是网关和 Scratch 扩展这两段。
+补上之后踩到两个坑, 现象都很像"板子/摄像头坏了", 记一下。
+
+### 坑 1: 上报码 0x13 (引脚探针) 把网关的接收循环直接打死
+
+telemetrix 的接收循环是这样派发的:
+
+```python
+report = packet[0]
+await self.report_dispatch[report](packet[1:])     # 直接索引, 没有兜底
+```
+
+`report_dispatch` 里没注册的上报码 -> `KeyError` -> **整个接收循环退出**。而且
+这个循环是个没人管的 asyncio task, 异常不会打到 stderr, 于是:
+
+* 网关进程还活着;
+* 到板子的 TCP 还是 ESTABLISHED;
+* 板子串口里照常打 `拍照: 指定帧数` / `帧对齐: 收到 20620 字节` / `拍完`;
+* 但 PC 侧**从此收不到板子任何上报**, 连 `0x7B` 摄像头状态都不回, 一行日志都没有。
+
+当时的触发源是 `CONFIG_TMX_CAMERA_PIN_PROBE=y` 已经打开: 每次摄像头初始化都会扫一遍
+DVP 各引脚, 顺带用 0x13 把探针结果上报给 PC —— 而网关没注册 0x13, 于是每次拍照前
+那一下初始化就把它打死了。
+
+两条一起做的修法:
+
+1. **关掉引脚探针** (`CONFIG_TMX_CAMERA_PIN_PROBE=n`)。它本来就是排障用的, 开着还会
+   让每次拍照多扫 40 个 GPIO、刷一堆 `GPIO number error`, 又慢又吵。
+   顺带修了一个既存编译错误: 探针关掉时 `probe_report()` 没有定义, 但"在线改 XCLK"
+   和"读寄存器"两处还在调它 -> `implicit declaration of function 'probe_report'`。
+   现在探针关掉时给一个空实现。
+2. **补丁 11**: 接收循环改成
+   `handler = self.report_dispatch.get(report)`, 没有处理器就打印一条
+   `unknown report id: N` 后 `continue`, 处理器抛异常也只丢掉这一条。
+   这样以后再冒出新上报码, 也是"少收一条"而不是"整条链路静默死掉"。
+
+### 坑 2: telemetrix 的 WiFi 读函数按"短读"写, 一帧 80 多片必错位
+
+`socket_aio_transport.py`:
+
+```python
+async def read(self, num_bytes=1):
+    buffer = await self.reader.read(num_bytes)    # asyncio: 只保证"最多 n 字节"
+    return buffer
+```
+
+而接收循环是"先读 1 个字节当长度, 再读那么多字节"。数据跨 TCP 分段时
+`read(n)` 会短读, 从此全体错位。小包(超声波/I2C/响度)一般一个 TCP 段就过去了,
+所以一直没暴露; 摄像头一帧 VGA 要发 80 多片, 必然踩到。
+
+**补丁 10** 把 `read()` 改成读满 `num_bytes` 再返回。
+
+### 怎么快速判断是哪一类问题
+
+不看网关日志光看现象很容易误判, 这几个观察点最省事:
+
+| 观察 | 说明什么 |
+| --- | --- |
+| 串口里板子在 `拍照`/`帧对齐: 收到 N 字节`/`拍完` | 板子侧完全正常, 问题在 PC 侧 |
+| 连 `camera_info` (0x7B) 都不回, 但网关进程和 TCP 都还在 | 接收循环已经死了 -> 坑 1 那一类 |
+| `camera_info` 回得来、照片收不到 | 拼帧/分片错位 -> 坑 2 那一类 |
+| 网关日志 `report N handler failed` / `unknown report id: N` | 就是坑 1, 看 N 是哪个上报码 |
+
+板子串口本身也不完全可靠(开机一段时间后会卡, 见前面), 但 `ets_printf` 和 TCP 上报
+一直是好的, 所以"板子到底有没有收到命令"优先看串口那几行 `tmx_camera` 日志。
+
+### 验证工具
+
+`tools/test_camera_blocks.py` 不打开 Scratch 就能验证整条网关链路 (发
+`ip_address`/`camera_config`/`camera_snapshot`, 收 `camera_info`/`camera_frame_start`/
+`camera_frame`/`camera_status`, 并把 JPEG 存盘 + 校验 SOI/EOI):
+
+```powershell
+# 用系统 Python (python_banyan / s3-extend 装在它下面)
+C:\Program Files\Python313\python.exe tools\test_camera_blocks.py --host 192.168.0.103 --frames 2 --dir tools\photos
+```
+
+扩展本身的积木逻辑用 `node tools\test_esp32s3_camera.js` 跑 (假 Scratch + 假 WebSocket,
+不需要编辑器也不需要板子)。

@@ -810,6 +810,17 @@ void tmx_camera_probe_pins(void)
 #endif /* CONFIG_TMX_CAMERA_PIN_PROBE */
 
 #if !CONFIG_TMX_CAMERA_PIN_PROBE
+/*
+ * 探针关掉时, 下面"在线调 XCLK"(0x7D field=18) 和"读寄存器"仍然会
+ * probe_report() 回一条给 PC —— 补一个空实现, 否则那句调用会变成
+ * implicit declaration (关掉探针就编译不过)。
+ */
+static void probe_report(uint8_t kind, int value)
+{
+    (void)kind;
+    (void)value;
+}
+
 void tmx_camera_probe_pins(void)
 {
     ESP_LOGW(TAG, "引脚探针没编译进来 (menuconfig -> 摄像头 -> 启动时量一遍 DVP 各根信号线的活动)");

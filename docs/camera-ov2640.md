@@ -142,16 +142,53 @@ python D:\esp\onegpio\tools\pc_camera_check.py 192.168.0.103 --view       # 拍�
 | 拍照后其它积木变卡 | 连续拍是"边拍边发", 把 `interval` 调大或拍完发 `CAMERA_STOP` |
 | 接上摄像头后板子启动异常 / 一直进下载模式 | VSYNC(IO3) 和 HREF(IO46) 是 ESP32-S3 的 Strapping 脚, 摄像头模块上电瞬间的电平可能影响启动采样。先断开这两个信号试上电: 能正常启动就是它, 换到非 Strapping 脚或给这两条线加上拉/下拉即可 |
 
-## 和 Scratch 的关系
+## Scratch 积木
 
-目前摄像头只在**协议层**开放 (上面那个 PC 脚本), Scratch 扩展里还没有
-"拍照" 积木: 把 JPEG 搬进 Scratch 需要先把二进制经 Banyan/WebSocket
-转成 base64 再做成造型, 属于另一条链路。要加的话建议这样分工:
+扩展 `scratch/esp32s3.js` 里有 6 块相机积木，整条链路和 PC 脚本走的是同一套协议：
 
 ```
-板子 0x0F 分片 ─► esp32gw 拼帧 ─► Banyan(from_esp32_gateway)
-                                   └► Scratch 扩展把 base64 变成造型
+点「拍照」积木
+   └─ 扩展 ws ─► wsgw ─► Banyan ─► esp32gw ─► TCP 0x79 ─► 板子
+                                                        │
+板子 0x10 帧头 + 0x0F 分片 (每片 ≤240 字节)  ◄───────────┘
+   └─ esp32gw 按偏移拼回整帧 ─► base64 ─► Banyan ─► wsgw ─► 扩展
+                                                                 │
+                              转成 PNG ─► vm.addCostume ─► 当前角色的新造型
 ```
 
-`tools/apply_local_patches.py` 里补丁 6/7/8 就是给网关加自定义命令的模板,
-补丁 9 可以照抄那套写法。
+| 积木 | 发出去的命令 | 说明 |
+| --- | --- | --- |
+| 拍照尺寸 [QVGA/VGA/.../UXGA] | `camera_config` (0x78) | 只改分辨率，质量那一项发 `0xFF` 表示不改 |
+| 拍照质量 [0~63] | `camera_config` (0x78) | 同上，只改质量 |
+| **拍照（照片变成新造型）** | `camera_snapshot` (0x79) | **会等**：整帧回来并挂成造型之后才继续执行下一条积木 |
+| 停止拍照 | `camera_stop` (0x7A) | 丢掉正在发的帧 |
+| 摄像头状态 | `camera_info` (0x7B) + 上报 0x12 | 报告积木；显示"最近发生的一件事"（拍照结果／分辨率质量 XCLK／出错提示） |
+| 照片（数据 URL） | —— | 最近一张照片的 `data:image/jpeg;base64,...`，可以自己拿去用 |
+
+### 几个要知道的点和坑
+
+* **「拍照」大概要 3 秒**。固件为了降温默认"拍完就断电"，所以每次拍照都要重新上电
+  初始化，再加上 `TMX_CAMERA_WARMUP_MS`(默认 2 秒) 的预热帧。嫌慢就把预热调短
+  （见上面"横纹/噪点"那节的取舍）。
+* **照片按"双倍分辨率"挂成造型**：640x480 的照片在 480x360 的舞台上占 320x240，
+  正好放得下。想让它更大就自己在 Scratch 里改角色大小。
+* **"自动变成造型"要用支持非沙箱扩展的编辑器**（TurboWarp）。扩展顶部有
+  `Scratch.extensions.unsandboxed = true`，靠它才能拿到 scratch-vm 的
+  `runtime.storage` / `vm.addCostume`。拿不到的编辑器里，拍照本身没问题，
+  「照片（数据 URL）」也能取到图，只是不会自动生成造型 —— 状态积木会说明原因。
+* **照片是 JPEG，造型是 PNG**：扩展会在浏览器里过一遍 canvas 转成 PNG 再挂上去，
+  和 Scratch 自己"上传一张 jpg"时的处理一致。
+* **摄像头只能一个人用**：板子同一时刻只服务一个客户端。Scratch 连着板子时，
+  PC 上的 `pc_camera_check.py` 会自动连不上（先 `tools\stop_s3extend.ps1`）。
+
+### 网关侧的三个补丁（`tools/apply_local_patches.py`）
+
+| 补丁 | 为什么必须有 |
+| --- | --- |
+| 9 | 网关认识 `camera_config/snapshot/stop/info`，并把 0x0F~0x12 转成 Scratch 的 report |
+| 10 | telemetrix 的 WiFi 读函数要**读满** `num_bytes`。一帧 80 多片，跨 TCP 分段时必现短读 |
+| 11 | 接收循环不能因为**没注册的上报码**（比如调试用的引脚探针 0x13）或处理器异常而静默死掉 |
+
+补丁 10 / 11 缺一个的现象都很像"板子坏了"：网关进程还在、到板子的 TCP 还是
+ESTABLISHED、串口里板子照常"拍照 / 送 20620 字节"，但照片永远收不到，连
+`camera_info` 都不再回。排查记录见 [camera-debug-notes.md](camera-debug-notes.md)。

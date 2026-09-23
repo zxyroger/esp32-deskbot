@@ -216,12 +216,19 @@ Get-NetTCPConnection -State Listen | Where-Object LocalPort -in 43124,43125,9007
 | 麦克风响度 | `audio_mic` (0x74) + 上报 0x0D | 读麦克风 0~100，需要先用「麦克风检测 开」打开 |
 | 朗读文字 | `audio_tts` (0x75) | 板子本地做中文语音合成（esp-tts），文字由网关按 UTF-8 拆包 |
 | 停止朗读 | `audio_tts_stop` (0x76) | 立刻停止朗读 |
+| 拍照尺寸 | `camera_config` (0x78) | QVGA / VGA / SVGA / XGA / SXGA / UXGA，拍之前发一条即可 |
+| 拍照质量 | `camera_config` (0x78) | 0~63，越小越清晰（帧也越大） |
+| 拍照（照片变成新造型） | `camera_snapshot` (0x79) | 等整帧回来并挂成**当前角色的新造型**再往下走；固件"拍完就断电降温"，所以每次约 3 秒 |
+| 停止拍照 | `camera_stop` (0x7A) | 丢掉正在发的那一帧 |
+| 摄像头状态 | `camera_info` (0x7B) + 上报 0x12 | 显示最近一件事：拍照结果 / 分辨率质量 XCLK / 出错提示 |
+| 照片（数据 URL） | —— | 最近一张照片的 `data:image/jpeg;base64,...` |
 
 另外固件还实现了协议层的 I2C 读写、输入上报开关、模拟扫描间隔、固件版本查询、
 回环测试和复位命令（这些是 s3-extend / telemetrix 客户端会用到或便于调试的命令）。
 
-摄像头目前只开放在**协议层**（还没有 Scratch 积木，见
-[docs/camera-ov2640.md](docs/camera-ov2640.md) 最后一节）：
+摄像头积木底下用的还是同一套协议命令（`0x78` ~ `0x7B`，上报 `0x0F` ~ `0x12`），
+网关负责把一帧的几十个分片拼回整图再 base64 交给 Scratch，细节见
+[docs/camera-ov2640.md](docs/camera-ov2640.md)：
 
 | 协议命令 | 板子上的动作 | 说明 |
 | --- | --- | --- |
@@ -237,11 +244,17 @@ D:\esp\onegpio\tools\stop_s3extend.ps1     # 板子同时只服务一个客户�
 python D:\esp\onegpio\tools\pc_camera_check.py 192.168.0.103 --view
 ```
 
-屏幕、音频和朗读这几块积木走的是自定义命令（0x70 ~ 0x77，官方 Telemetrix 协议没有），
+屏幕、音频、朗读和摄像头这几块积木走的是自定义命令（0x70 ~ 0x7B，官方 Telemetrix 协议没有），
 需要 PC 端网关认识它们：网关侧由 `python tools\apply_local_patches.py` 的
-**补丁 6（屏幕）/ 补丁 7（音频）/ 补丁 8（朗读）** 写入，链路是
+**补丁 6（屏幕）/ 补丁 7（音频）/ 补丁 8（朗读）/ 补丁 9（摄像头）** 写入，链路是
 Scratch → wsgw/backplane → esp32gw → 板子。如果升级过 s3-extend，记得重跑一次
 补丁脚本并重启网关，否则只有这几块积木没反应，其它积木照常工作。
+
+摄像头还额外依赖 **补丁 10（WiFi 读函数读满）** 和 **补丁 11（接收循环不因未知
+上报/处理器异常而静默退出）**：一帧要发 80 多片，这两个不补上会表现为"能连上板子、
+`摄像头状态` 也回得来，但照片永远收不到"（网关进程还活着、TCP 还连着，只是接收
+循环已经死了，而且一行日志都没有）。排查过程见
+[docs/camera-debug-notes.md](docs/camera-debug-notes.md)。
 
 触摸、DHT、SPI、OneWire、步进电机这些原版 Arduino 固件里有、但 Scratch 的
 ESP32 扩展没有开放的命令，本工程暂未实现（收到时会打印一条告警日志，不会崩）。

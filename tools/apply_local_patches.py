@@ -67,6 +67,36 @@
     0x75 包 (最后一段带标志位) 发给板子, 板子拼起来再合成;
     「停止朗读」-> 0x76。补丁 8 依赖补丁 7。
 
+补丁 9: s3_extend 的 esp32 网关增加"摄像头积木" (板载 OV2640)
+    见 docs/camera-ov2640.md。四块积木要转成自定义命令:
+    「拍照尺寸」/「拍照质量」-> 0x78, 「拍照」-> 0x79, 「停止拍照」-> 0x7A,
+    「摄像头状态」-> 0x7B。
+    板子回的是每帧一坨: 0x10 (帧头: 序号/格式/宽/高/长度) + 若干 0x0F
+    (序号/帧内偏移/≤240 字节 JPEG 分片)。网关要按偏移拼回整帧再 base64
+    发给 Scratch —— Banyan 用 msgpack 能传 bytes, 但 wsgw 最后是
+    json.dumps(), bytes 过不去, 所以这里就编成 base64 字符串。
+    0x11 (拍照进度) / 0x12 (摄像头状态) 也一并转成 report。
+
+    注意: telemetrix 的接收循环是 self.report_dispatch[report] 直接索引,
+    少注册一个上报码就会 KeyError 把整个网关的接收循环带崩 —— 所以
+    0x0F / 0x10 / 0x11 / 0x12 四个都必须挂上处理器。
+
+补丁 10: telemetrix 的 WiFi 读函数必须"读满"
+    socket_aio_transport.read() 原来是
+
+        buffer = await self.reader.read(num_bytes)
+        return buffer
+
+    而 asyncio 的 StreamReader.read(n) 只保证"最多 n 字节": 有多少给多少。
+    telemetrix 的接收循环却是 `packet_length = ord(read())` 然后
+    `read(packet_length)` —— 一旦某一小片数据刚好跨 TCP 分段, 就会短读,
+    接下来每一片都错位, 循环要么 KeyError 要么卡住。
+
+    表现得非常迷惑: 网关进程还活着、到板子的 TCP 还是 ESTABLISHED、
+    串口日志里板子照常"拍照 / 送 20620 字节", 但从此再也收不到板子任何上报
+    (连 0x7B 摄像头状态都不回)。摄像头一帧要发 80 多片, 必然触发。
+    这里改成读满 num_bytes 再返回。
+
 用法:
     python tools\\apply_local_patches.py            # 放行 10, 11
     python tools\\apply_local_patches.py 10 11 4   # 指定额外放行的引脚
@@ -525,6 +555,297 @@ def patch_esp32_gateway_tts(path):
     return True, bak
 
 
+# ---- 补丁 9: esp32 网关支持"摄像头积木" (OV2640 拍照) ----
+CAMERA_GW_IMPORT_OLD = (
+    "import argparse\n"
+    "import asyncio\n"
+    "import signal\n"
+)
+
+CAMERA_GW_IMPORT_NEW = (
+    "import argparse\n"
+    "import asyncio\n"
+    "import base64\n"
+    "import signal\n"
+)
+
+CAMERA_GW_CONST_OLD = (
+    "TMX_REPORT_AUDIO_LEVEL = 0x0D  # 1 字节: 0~100 麦克风响度\n"
+)
+
+CAMERA_GW_CONST_NEW = CAMERA_GW_CONST_OLD + (
+    "\n"
+    "# 本地补丁 9: 摄像头 (OV2640), 与固件 main/tmx_protocol.h 对应\n"
+    "TMX_CMD_CAMERA_CONFIG = 0x78    # 3 字节: 分辨率索引 / JPEG 质量 / [像素格式], 0xFF=不改\n"
+    "TMX_CMD_CAMERA_SNAPSHOT = 0x79  # 3 字节: 帧数(1) + 间隔ms(2, 大端); 帧数 0 = 连续拍\n"
+    "TMX_CMD_CAMERA_STOP = 0x7A      # 无数据: 停止拍照\n"
+    "TMX_CMD_CAMERA_INFO = 0x7B      # 无数据 -> 回 0x12\n"
+    "TMX_REPORT_CAMERA_FRAME = 0x0F      # 序号(1) 偏移(3,大端) + JPEG 分片 (<=240 字节)\n"
+    "TMX_REPORT_CAMERA_FRAME_INFO = 0x10 # 序号(1) 格式(1) 宽(2) 高(2) 长度(4, 小端)\n"
+    "TMX_REPORT_CAMERA_STATUS = 0x11     # 状态(1) 数值(1)\n"
+    "TMX_REPORT_CAMERA_INFO = 0x12       # 状态(1) 宽(2) 高(2) 质量(1) 分辨率索引(1) XCLK MHz(1)\n"
+    "CAMERA_SIZE_NAMES = ('QVGA', 'VGA', 'SVGA', 'XGA', 'SXGA', 'UXGA')\n"
+    "\n"
+    "\n"
+    "def optional_byte(value, low, high):\n"
+    "    \"\"\"积木没给这一项 -> 0xFF, 表示让固件保持原值\"\"\"\n"
+    "    if value is None or value == '':\n"
+    "        return 0xFF\n"
+    "    return clamp_int(value, low, high, 0xFF)\n"
+)
+
+CAMERA_GW_CMD_OLD = (
+    "        elif command == 'audio_tts_stop':\n"
+    "            await self.send_raw_command([TMX_CMD_TTS_STOP])\n"
+)
+
+CAMERA_GW_CMD_NEW = CAMERA_GW_CMD_OLD + (
+    "        elif command == 'camera_config':\n"
+    "            await self.send_camera_config(payload)\n"
+    "        elif command == 'camera_snapshot':\n"
+    "            await self.send_camera_snapshot(payload)\n"
+    "        elif command == 'camera_stop':\n"
+    "            await self.send_camera_stop()\n"
+    "        elif command == 'camera_info':\n"
+    "            await self.send_camera_info()\n"
+)
+
+CAMERA_GW_METHOD_OLD = (
+    "        for index, chunk in enumerate(chunks):\n"
+    "            last = 1 if index == len(chunks) - 1 else 0\n"
+    "            await self.send_raw_command([TMX_CMD_TTS_TEXT, last] + list(chunk))\n"
+)
+
+CAMERA_GW_METHOD_NEW = CAMERA_GW_METHOD_OLD + (
+    "\n"
+    "    # ---- 本地补丁 9: 摄像头 (OV2640) ----\n"
+    "\n"
+    "    def camera_reset(self):\n"
+    "        \"\"\"丢掉正在拼的那一帧 (重新拍照前调用)\"\"\"\n"
+    "        self._cam_meta = None\n"
+    "        self._cam_buf = None\n"
+    "        self._cam_gaps = 0\n"
+    "\n"
+    "    async def send_camera_config(self, payload):\n"
+    "        \"\"\"0x78: 分辨率索引 / JPEG 质量 (没给的项保持原值)\"\"\"\n"
+    "        await self.send_raw_command([\n"
+    "            TMX_CMD_CAMERA_CONFIG,\n"
+    "            optional_byte(payload.get('size'), 0, 5),\n"
+    "            optional_byte(payload.get('quality'), 0, 63),\n"
+    "        ])\n"
+    "\n"
+    "    async def send_camera_snapshot(self, payload):\n"
+    "        \"\"\"0x79: 拍照。帧数 0 = 连续拍 (直到 camera_stop)\"\"\"\n"
+    "        frames = clamp_int(payload.get('frames'), 0, 255, 1)\n"
+    "        interval = clamp_int(payload.get('interval'), 0, 60000, 0)\n"
+    "        self.camera_reset()     # 新一轮拍照, 别接着拼上一轮的半帧\n"
+    "        await self.send_raw_command([TMX_CMD_CAMERA_SNAPSHOT, frames,\n"
+    "                                     (interval >> 8) & 0xFF, interval & 0xFF])\n"
+    "\n"
+    "    async def send_camera_stop(self):\n"
+    "        await self.send_raw_command([TMX_CMD_CAMERA_STOP])\n"
+    "\n"
+    "    async def send_camera_info(self):\n"
+    "        await self.send_raw_command([TMX_CMD_CAMERA_INFO])\n"
+    "\n"
+    "    async def _camera_frame_info(self, data):\n"
+    "        \"\"\"0x10: 一帧的开头 (序号/格式/宽/高/长度), 在这儿开一个新缓冲\"\"\"\n"
+    "        if len(data) < 10:\n"
+    "            return\n"
+    "        self._cam_meta = {\n"
+    "            'index': data[0],\n"
+    "            'format': data[1],\n"
+    "            'width': (data[2] << 8) | data[3],\n"
+    "            'height': (data[4] << 8) | data[5],\n"
+    "            'length': int.from_bytes(bytes(data[6:10]), 'little'),\n"
+    "        }\n"
+    "        self._cam_buf = bytearray()\n"
+    "        self._cam_gaps = 0\n"
+    "        await self.publish_payload(dict(self._cam_meta, report='camera_frame_start'),\n"
+    "                                   'from_esp32_gateway')\n"
+    "\n"
+    "    async def _camera_frame(self, data):\n"
+    "        \"\"\"0x0F: 一帧的一片。按偏移拼起来, 收齐了 base64 之后发给 Scratch\"\"\"\n"
+    "        meta = getattr(self, '_cam_meta', None)\n"
+    "        buf = getattr(self, '_cam_buf', None)\n"
+    "        if meta is None or buf is None or len(data) < 5:\n"
+    "            return          # 没收到帧头 (比如中途才开始收), 丢掉\n"
+    "        offset = (data[1] << 16) | (data[2] << 8) | data[3]\n"
+    "        if offset != len(buf):\n"
+    "            # 分片错位: 这一帧已经不可信了, 丢掉, 等下一帧的帧头\n"
+    "            self._cam_gaps = getattr(self, '_cam_gaps', 0) + 1\n"
+    "            self._cam_buf = None\n"
+    "            self._cam_meta = None\n"
+    "            return\n"
+    "        buf += bytes(data[4:])\n"
+    "        if len(buf) < meta['length']:\n"
+    "            return\n"
+    "        meta = dict(meta)\n"
+    "        meta['data'] = base64.b64encode(bytes(buf[:meta['length']])).decode('ascii')\n"
+    "        self._cam_buf = None\n"
+    "        self._cam_meta = None\n"
+    "        await self.publish_payload(dict(meta, report='camera_frame'),\n"
+    "                                   'from_esp32_gateway')\n"
+    "\n"
+    "    async def _camera_status(self, data):\n"
+    "        \"\"\"0x11: 拍照进度 (0=空闲 1=开始拍 2=出错)\"\"\"\n"
+    "        if not data:\n"
+    "            return\n"
+    "        state = data[0]\n"
+    "        await self.publish_payload({\n"
+    "            'report': 'camera_status',\n"
+    "            'state': state,\n"
+    "            'state_name': {0: 'idle', 1: 'busy', 2: 'error'}.get(state, '?'),\n"
+    "            'value': data[1] if len(data) > 1 else 0,\n"
+    "        }, 'from_esp32_gateway')\n"
+    "\n"
+    "    async def _camera_info(self, data):\n"
+    "        \"\"\"0x12: 摄像头状态 (分辨率 / JPEG 质量 / XCLK), 回应 0x7B\"\"\"\n"
+    "        if len(data) < 6:\n"
+    "            return\n"
+    "        size_index = data[6] if len(data) > 6 else -1\n"
+    "        await self.publish_payload({\n"
+    "            'report': 'camera_info',\n"
+    "            'state': data[0],\n"
+    "            'width': (data[1] << 8) | data[2],\n"
+    "            'height': (data[3] << 8) | data[4],\n"
+    "            'quality': data[5],\n"
+    "            'size_index': size_index,\n"
+    "            'size_name': CAMERA_SIZE_NAMES[size_index]\n"
+    "                         if 0 <= size_index < len(CAMERA_SIZE_NAMES) else '?',\n"
+    "            'xclk_mhz': data[7] if len(data) > 7 else 0,\n"
+    "        }, 'from_esp32_gateway')\n"
+)
+
+CAMERA_GW_DISPATCH_OLD = (
+    "        # 本地补丁 7: 板子的音频上报 (0x0D) 走自定义处理, 再发给 Scratch\n"
+    "        self.esp.report_dispatch[TMX_REPORT_AUDIO_LEVEL] = self._audio_level_report\n"
+)
+
+CAMERA_GW_DISPATCH_NEW = CAMERA_GW_DISPATCH_OLD + (
+    "\n"
+    "        # 本地补丁 9: 摄像头上报 (0x0F/0x10/0x11/0x12) 走自定义处理。\n"
+    "        # telemetrix 的接收循环是 report_dispatch[report] 直接索引,\n"
+    "        # 少注册一个上报码就会 KeyError 把接收循环带崩, 所以四个都要挂上。\n"
+    "        self.esp.report_dispatch[TMX_REPORT_CAMERA_FRAME] = self._camera_frame\n"
+    "        self.esp.report_dispatch[TMX_REPORT_CAMERA_FRAME_INFO] = self._camera_frame_info\n"
+    "        self.esp.report_dispatch[TMX_REPORT_CAMERA_STATUS] = self._camera_status\n"
+    "        self.esp.report_dispatch[TMX_REPORT_CAMERA_INFO] = self._camera_info\n"
+)
+
+
+def patch_esp32_gateway_camera(path):
+    """让 esp32 网关支持摄像头积木; 返回 (是否改动, 备份路径)"""
+    text = path.read_text(encoding="utf-8")
+    if "本地补丁 9" in text and "TMX_CMD_CAMERA_SNAPSHOT" in text:
+        return False, None
+    if (CAMERA_GW_IMPORT_OLD not in text or CAMERA_GW_CONST_OLD not in text or
+            CAMERA_GW_CMD_OLD not in text or CAMERA_GW_METHOD_OLD not in text or
+            CAMERA_GW_DISPATCH_OLD not in text):
+        return None, None      # 补丁 6/7/8 还没打, 交给上层提示
+    bak = backup(path)
+    text = text.replace(CAMERA_GW_IMPORT_OLD, CAMERA_GW_IMPORT_NEW, 1)
+    text = text.replace(CAMERA_GW_CONST_OLD, CAMERA_GW_CONST_NEW, 1)
+    text = text.replace(CAMERA_GW_CMD_OLD, CAMERA_GW_CMD_NEW, 1)
+    text = text.replace(CAMERA_GW_METHOD_OLD, CAMERA_GW_METHOD_NEW, 1)
+    text = text.replace(CAMERA_GW_DISPATCH_OLD, CAMERA_GW_DISPATCH_NEW, 1)
+    path.write_text(text, encoding="utf-8")
+    return True, bak
+
+
+# ---- 补丁 10: telemetrix 的 WiFi 读函数改成"读满 num_bytes" ----
+TRANSPORT_READ_OLD = (
+    "    async def read(self, num_bytes=1):\n"
+    "        \"\"\"\n"
+    "        This method reads num_bytes of data from IP device\n"
+    "\n"
+    "        :return: Next byte\n"
+    "        \"\"\"\n"
+    "        buffer = await self.reader.read(num_bytes)\n"
+    "        return buffer\n"
+)
+
+TRANSPORT_READ_NEW = (
+    "    async def read(self, num_bytes=1):\n"
+    "        \"\"\"\n"
+    "        This method reads num_bytes of data from IP device\n"
+    "\n"
+    "        :return: Next byte\n"
+    "        \"\"\"\n"
+    "        # 本地补丁 10: 一定要读满 num_bytes 再返回。\n"
+    "        # asyncio 的 StreamReader.read(n) 只保证\"最多 n 字节\":\n"
+    "        # 数据刚好跨 TCP 分段时会给一个短读, telemetrix 的接收循环\n"
+    "        # (先读长度再读那么多字节) 会因此全体错位, 要么 KeyError 要么\n"
+    "        # 卡住。摄像头一帧 80 多片, 必然踩到。\n"
+    "        buffer = await self.reader.read(num_bytes)\n"
+    "        while len(buffer) < num_bytes:\n"
+    "            more = await self.reader.read(num_bytes - len(buffer))\n"
+    "            if not more:\n"
+    "                break           # 对端关了, 把已有的给出去\n"
+    "            buffer += more\n"
+    "        return buffer\n"
+)
+
+
+def patch_telemetrix_read_exact(path):
+    """让 telemetrix 的 WiFi 读函数读满再返回; 返回 (是否改动, 备份路径)"""
+    text = path.read_text(encoding="utf-8")
+    if "本地补丁 10" in text:
+        return False, None
+    if TRANSPORT_READ_OLD not in text:
+        return None, None      # 上游代码变了, 交给上层提示
+    bak = backup(path)
+    text = text.replace(TRANSPORT_READ_OLD, TRANSPORT_READ_NEW, 1)
+    path.write_text(text, encoding="utf-8")
+    return True, bak
+
+
+# ---- 补丁 11: telemetrix 的接收循环不能"静默死掉" ----
+TRANSPORT_DISPATCH_OLD = (
+    "            report = packet[0]\n"
+    "            # print(report)\n"
+    "            # handle all other messages by looking them up in the\n"
+    "            # command dictionary\n"
+    "\n"
+    "            # print(f'packet: {packet[1:]}')\n"
+    "            await self.report_dispatch[report](packet[1:])\n"
+)
+
+TRANSPORT_DISPATCH_NEW = (
+    "            if not packet:\n"
+    "                # 本地补丁 11: 读空了别 IndexError 把整个循环带走\n"
+    "                continue\n"
+    "            report = packet[0]\n"
+    "            # 本地补丁 11: 没注册的上报码、处理器里抛的异常, 都只丢掉这\n"
+    "            # 一条。上游是 report_dispatch[report] 直接索引 (KeyError) 而且\n"
+    "            # 不兜异常, 表现极其迷惑: 网关进程还活着、到板子的 TCP 还是\n"
+    "            # ESTABLISHED、串口里板子照常出图, 但从此板子任何上报都收不到,\n"
+    "            # 而且一行日志都没有。\n"
+    "            handler = self.report_dispatch.get(report)\n"
+    "            if handler is None:\n"
+    "                print(f'unknown report id: {report} '\n"
+    "                      f'(packet_length={packet_length}, data={packet[1:8]})')\n"
+    "                continue\n"
+    "            try:\n"
+    "                await handler(packet[1:])\n"
+    "            except Exception as exc:\n"
+    "                print(f'report {report} handler failed: {exc!r}')\n"
+)
+
+
+def patch_telemetrix_dispatch_guard(path):
+    """让接收循环对未知上报/处理器异常免疫; 返回 (是否改动, 备份路径)"""
+    text = path.read_text(encoding="utf-8")
+    if "本地补丁 11" in text:
+        return False, None
+    if TRANSPORT_DISPATCH_OLD not in text:
+        return None, None
+    bak = backup(path)
+    text = text.replace(TRANSPORT_DISPATCH_OLD, TRANSPORT_DISPATCH_NEW, 1)
+    path.write_text(text, encoding="utf-8")
+    return True, bak
+
+
 def main():
     parser = argparse.ArgumentParser(description="给第三方包打本地补丁")
     parser.add_argument("pins", nargs="*", type=int, default=None,
@@ -541,11 +862,11 @@ def main():
         print("目标: %s" % telemetrix)
         result = patch_telemetrix_pins(telemetrix, extra_pins)
         if not result:
-            print("  [1/8] 引脚表: 已放行 %s, 无需改动" %
+            print("  [1/11] 引脚表: 已放行 %s, 无需改动" %
                   ", ".join(str(p) for p in extra_pins))
         else:
             changed, bak = result
-            print("  [1/8] 引脚表: 已放行 %s (%s)" %
+            print("  [1/11] 引脚表: 已放行 %s (%s)" %
                   (", ".join(str(p) for p in extra_pins), ", ".join(changed)))
             print("        备份: %s" % bak)
 
@@ -557,10 +878,10 @@ def main():
         print("目标: %s" % banyan)
         changed, bak = patch_banyan_psutil(banyan)
         if changed:
-            print("  [2/8] psutil 扫描: 已忽略 NoSuchProcess")
+            print("  [2/11] psutil 扫描: 已忽略 NoSuchProcess")
             print("        备份: %s" % bak)
         elif changed is False:
-            print("  [2/8] psutil 扫描: 已是补丁状态, 无需改动")
+            print("  [2/11] psutil 扫描: 已是补丁状态, 无需改动")
         else:
             problems.append("python_banyan 的代码与预期不一致, 请手动检查 psutil 那一段")
 
@@ -572,52 +893,89 @@ def main():
         print("目标: %s" % esp32_gateway)
         changed, bak = patch_esp32_gateway_wait_for_ip(esp32_gateway)
         if changed:
-            print("  [3/8] ip_address 报文: 已忽略非 ip_address 的报文")
+            print("  [3/11] ip_address 报文: 已忽略非 ip_address 的报文")
             print("        备份: %s" % bak)
         elif changed is False:
-            print("  [3/8] ip_address 报文: 已是补丁状态, 无需改动")
+            print("  [3/11] ip_address 报文: 已是补丁状态, 无需改动")
         else:
             problems.append("esp32_gateway.py 的代码与预期不一致, 请手动检查 main() 那一段")
 
         # ---- 补丁 4: 接收循环不能在 self.esp 之前启动 ----
         changed, bak = patch_esp32_gateway_receive_loop(esp32_gateway)
         if changed:
-            print("  [4/8] 接收循环: 改为连上板子后再启动")
+            print("  [4/11] 接收循环: 改为连上板子后再启动")
             print("        备份: %s" % bak)
         elif changed is False:
-            print("  [4/8] 接收循环: 已是补丁状态, 无需改动")
+            print("  [4/11] 接收循环: 已是补丁状态, 无需改动")
         else:
             problems.append("esp32_gateway.py 里找不到 begin(start_loop=True), 请手动检查")
 
         # ---- 补丁 6: 屏幕积木 (背光 / 颜色) ----
         changed, bak = patch_esp32_gateway_lcd(esp32_gateway)
         if changed:
-            print("  [6/8] 屏幕积木: 已加入 lcd_backlight / lcd_color 命令")
+            print("  [6/11] 屏幕积木: 已加入 lcd_backlight / lcd_color 命令")
             print("        备份: %s" % bak)
         elif changed is False:
-            print("  [6/8] 屏幕积木: 已是补丁状态, 无需改动")
+            print("  [6/11] 屏幕积木: 已是补丁状态, 无需改动")
         else:
             problems.append("esp32_gateway.py 里找不到 additional_banyan_messages, 请手动检查")
 
         # ---- 补丁 7: 音频积木 (音调 / 停止 / 麦克风响度) ----
         changed, bak = patch_esp32_gateway_audio(esp32_gateway)
         if changed:
-            print("  [7/8] 音频积木: 已加入 audio_tone / audio_stop / audio_mic 与响度上报")
+            print("  [7/11] 音频积木: 已加入 audio_tone / audio_stop / audio_mic 与响度上报")
             print("        备份: %s" % bak)
         elif changed is False:
-            print("  [7/8] 音频积木: 已是补丁状态, 无需改动")
+            print("  [7/11] 音频积木: 已是补丁状态, 无需改动")
         else:
             problems.append("esp32_gateway.py 里找不到屏幕积木补丁的代码, 请先检查补丁 6")
 
         # ---- 补丁 8: 朗读文字 (板载 TTS) ----
         changed, bak = patch_esp32_gateway_tts(esp32_gateway)
         if changed:
-            print("  [8/8] 朗读文字: 已加入 audio_tts / audio_tts_stop (UTF-8 拆包)")
+            print("  [8/11] 朗读文字: 已加入 audio_tts / audio_tts_stop (UTF-8 拆包)")
             print("        备份: %s" % bak)
         elif changed is False:
-            print("  [8/8] 朗读文字: 已是补丁状态, 无需改动")
+            print("  [8/11] 朗读文字: 已是补丁状态, 无需改动")
         else:
             problems.append("esp32_gateway.py 里找不到音频积木补丁的代码, 请先检查补丁 7")
+
+        # ---- 补丁 9: 摄像头积木 (OV2640 拍照) ----
+        changed, bak = patch_esp32_gateway_camera(esp32_gateway)
+        if changed:
+            print("  [9/11] 摄像头积木: 已加入 camera_config / camera_snapshot / "
+                  "camera_stop / camera_info 与拼帧上报")
+            print("        备份: %s" % bak)
+        elif changed is False:
+            print("  [9/11] 摄像头积木: 已是补丁状态, 无需改动")
+        else:
+            problems.append("esp32_gateway.py 里找不到朗读文字补丁的代码, 请先检查补丁 8")
+
+    # ---- 补丁 10: telemetrix 的 WiFi 读函数要读满 (一帧几十片, 必踩短读) ----
+    transport = find_module_path("telemetrix_aio_esp32.socket_aio_transport")
+    if not transport or not transport.exists():
+        problems.append("找不到 telemetrix_aio_esp32.socket_aio_transport, "
+                        "摄像头积木很可能收不全帧")
+    else:
+        changed, bak = patch_telemetrix_read_exact(transport)
+        if changed:
+            print("  [10/11] WiFi 读函数: 改成读满 num_bytes (修分片错位)")
+            print("          备份: %s" % bak)
+        elif changed is False:
+            print("  [10/11] WiFi 读函数: 已是补丁状态, 无需改动")
+        else:
+            problems.append("socket_aio_transport.py 的 read() 与预期不一致, 请手动检查")
+
+    # ---- 补丁 11: telemetrix 的接收循环不能静默死掉 ----
+    if telemetrix and telemetrix.exists():
+        changed, bak = patch_telemetrix_dispatch_guard(telemetrix)
+        if changed:
+            print("  [11/11] 接收循环: 未知上报/处理器异常不再静默搞死循环")
+            print("          备份: %s" % bak)
+        elif changed is False:
+            print("  [11/11] 接收循环: 已是补丁状态, 无需改动")
+        else:
+            problems.append("telemetrix_aio_esp32.py 的接收循环与预期不一致, 请手动检查")
 
     # ---- 补丁 5: Banyan 固定用回环地址 (本机 IP 变化不再影响连接) ----
     loopback_targets = (
@@ -634,10 +992,10 @@ def main():
             continue
         changed, bak = patch_func(target)
         if changed:
-            print("  [5/8] %s: 已改为回环/全网卡" % label)
+            print("  [5/11] %s: 已改为回环/全网卡" % label)
             print("        备份: %s" % bak)
         elif changed is False:
-            print("  [5/8] %s: 已是补丁状态, 无需改动" % label)
+            print("  [5/11] %s: 已是补丁状态, 无需改动" % label)
         else:
             problems.append("%s 的代码与预期不一致, 请手动检查 IP 解析那一段" % module)
 

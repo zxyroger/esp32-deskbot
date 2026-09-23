@@ -26,6 +26,14 @@
 (function (Scratch) {
     'use strict';
 
+    /*
+     * 摄像头积木里「拍完直接变成造型」需要 scratch-vm 的内部接口
+     * (runtime.storage / vm.addCostume), 沙箱里的扩展拿不到 —— 这一行请求
+     * 编辑器把扩展跑在非沙箱环境 (TurboWarp 支持; 不支持的编辑器会忽略它,
+     * 那时拍照仍然能拿到照片数据, 只是不会自动生成造型)。
+     */
+    Scratch.extensions.unsandboxed = true;
+
     var WS_URL = 'ws://127.0.0.1:9007';
     var BANYAN_ID = 'to_esp32_gateway';       // 与 s3-extend 的 esp32gw 一致
     var REPORT_TOPIC = 'from_esp32_gateway';
@@ -47,6 +55,11 @@
     // 10 / 11 是这块板子引出舵机排针的 GPIO (ESP32-S3 上它们不是保留脚)
     var DIGITAL_PINS = ['2', '4', '5', '10', '11', '12', '13', '14', '16', '17', '18', '19', '21'];
     var ANALOG_PINS = ['32', '33', '34', '35', '36', '39'];
+
+    // 摄像头: 分辨率索引与固件一致 (0=QVGA ~ 5=UXGA)
+    var CAMERA_SIZES = ['QVGA', 'VGA', 'SVGA', 'XGA', 'SXGA', 'UXGA'];
+    var CAMERA_PHOTO_TIMEOUT_MS = 20000;   // 「拍照」积木最多等这么久
+    var CAMERA_INFO_REFRESH_MS = 2000;     // 「摄像头状态」的查询/显示节流
 
     // 引脚模式编号 (与固件/telemetrix 协议一致)
     var AT_OUTPUT = 1;
@@ -85,6 +98,15 @@
         this.pollTimer = null;              // 拉起期间的轮询定时器
         this.launchTimer = null;            // "点积木后 0.7 秒还没连上就拉起"的定时器
         this.pendingConnectIp = '';         // 服务起来后要接着连的板子 IP
+        // 摄像头 (OV2640 拍照)
+        this.photoDataUrl = '';             // 最近一张照片的 data URL
+        this.photoCount = 0;                // 已经变成造型的照片数
+        this.photoDeferred = null;          // 「拍照」积木在等的那个 promise
+        this.cameraInfoValue = null;        // 最近一次 0x12 摄像头状态
+        this.cameraInfoAt = 0;              // 上面那次的时刻 (节流用)
+        // 「摄像头状态」积木显示的就是最近发生的这一件事 (拍照结果 / 出错 / 分辨率)
+        this.cameraNote = '还没拍过（点「拍照」试试）';
+        this.cameraNoteAt = 0;
     }
 
     // 把状态拼成一句给人看的话。
@@ -134,6 +156,88 @@
             return '正在启动本地服务…（点积木触发的自动拉起，约 10~20 秒）';
         }
         return '本地服务未启动（点任意积木会自动拉起）';
+    }
+
+    /* ------------------------- 摄像头辅助 ------------------------- */
+
+    function makeDeferred() {
+        var deferred = {};
+        deferred.promise = new Promise(function (resolve) { deferred.resolve = resolve; });
+        return deferred;
+    }
+
+    /*
+     * 板子给的是 JPEG, 而 Scratch 的位图造型是 PNG —— 先过一遍 canvas 转成 PNG。
+     * (和 Scratch 自己"上传一张 jpg"时做的事一样: 直接塞 JPEG 资源虽然浏览器
+     *  多半也能画出来, 但 DataFormat 和渲染器的假设对不上, 不保险。)
+     */
+    function jpegToPngBytes(base64) {
+        return new Promise(function (resolve, reject) {
+            var image = new Image();
+            image.onload = function () {
+                var canvas = document.createElement('canvas');
+                canvas.width = image.width;
+                canvas.height = image.height;
+                canvas.getContext('2d').drawImage(image, 0, 0);
+                canvas.toBlob(function (blob) {
+                    if (!blob) {
+                        reject(new Error('照片转 PNG 失败'));
+                        return;
+                    }
+                    var reader = new FileReader();
+                    reader.onload = function () { resolve(new Uint8Array(reader.result)); };
+                    reader.onerror = function () { reject(new Error('照片转 PNG 读回失败')); };
+                    reader.readAsArrayBuffer(blob);
+                }, 'image/png');
+            };
+            image.onerror = function () { reject(new Error('照片解码失败')); };
+            image.src = 'data:image/jpeg;base64,' + base64;
+        });
+    }
+
+    /*
+     * 把一帧照片加成当前角色的一个新造型。
+     *
+     * 扩展本身没有"加造型"的 API, 得借编辑器内部的 scratch-vm:
+     *   1. runtime.storage.createAsset() 把 PNG 字节存成一个资源;
+     *   2. vm.addCostume(md5ext, costume, targetId) 加载并挂到角色上,
+     *      顺手把它设成当前造型。
+     * 这要求扩展跑在非沙箱模式 (见文件开头的 Scratch.extensions.unsandboxed)。
+     * 拿不到 VM 时抛错, 外面会把它显示成一句人话。
+     */
+    function addPhotoCostume(msg, base64, name) {
+        return new Promise(function (resolve, reject) {
+            var vm = Scratch.vm;
+            if (!vm || !vm.runtime || !vm.runtime.storage || !vm.runtime.renderer ||
+                    !vm.editingTarget || !vm.editingTarget.sprite) {
+                reject(new Error('拿不到编辑器内部接口，没法自动变成造型' +
+                                 '（换 TurboWarp 这类支持非沙箱扩展的编辑器打开）'));
+                return;
+            }
+            jpegToPngBytes(base64).then(function (bytes) {
+                var storage = vm.runtime.storage;
+                var asset = storage.createAsset(storage.AssetType.ImageBitmap,
+                                                storage.DataFormat.PNG,
+                                                bytes, null, true);
+                var width = parseInt(msg['width'], 10) || 0;
+                var height = parseInt(msg['height'], 10) || 0;
+                var costume = {
+                    name: name,
+                    asset: asset,
+                    assetId: asset.assetId,
+                    dataFormat: storage.DataFormat.PNG,
+                    md5: asset.assetId + '.' + storage.DataFormat.PNG,
+                    // 按"双倍分辨率"挂: 640x480 的照片在 480x360 的舞台上占 320x240,
+                    // 正好放得下; 用 1 的话会变成 640x480 单位, 四边都被裁掉。
+                    bitmapResolution: 2,
+                    rotationCenterX: width / 2,
+                    rotationCenterY: height / 2
+                };
+                return vm.addCostume(costume.md5, costume, vm.editingTarget.id);
+            }).then(function () {
+                resolve('已把「' + name + '」加为造型');
+            }).catch(reject);
+        });
     }
 
     Esp32S3.prototype.getInfo = function () {
@@ -269,6 +373,51 @@
                 },
                 '---',
                 {
+                    opcode: 'cameraSize',
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: '拍照尺寸 [SIZE]',
+                    arguments: {
+                        SIZE: {
+                            type: Scratch.ArgumentType.STRING,
+                            menu: 'cameraSizes',
+                            defaultValue: 'VGA'
+                        }
+                    }
+                },
+                {
+                    opcode: 'cameraQuality',
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: '拍照质量 [QUALITY]',
+                    arguments: {
+                        QUALITY: { type: Scratch.ArgumentType.NUMBER, defaultValue: 20 }
+                    }
+                },
+                {
+                    opcode: 'takePhoto',
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: '拍照（照片变成新造型）',
+                    arguments: {}
+                },
+                {
+                    opcode: 'cameraStop',
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: '停止拍照',
+                    arguments: {}
+                },
+                {
+                    opcode: 'cameraState',
+                    blockType: Scratch.BlockType.REPORTER,
+                    text: '摄像头状态',
+                    arguments: {}
+                },
+                {
+                    opcode: 'photoData',
+                    blockType: Scratch.BlockType.REPORTER,
+                    text: '照片（数据 URL）',
+                    arguments: {}
+                },
+                '---',
+                {
                     opcode: 'boardStatus',
                     blockType: Scratch.BlockType.REPORTER,
                     text: '连接状态',
@@ -298,7 +447,8 @@
                 digitalPins: { acceptReporters: true, items: DIGITAL_PINS },
                 analogPins: { acceptReporters: true, items: ANALOG_PINS },
                 onOff: { acceptReporters: true, items: ['0', '1'] },
-                backlightState: { acceptReporters: true, items: ['开', '关'] }
+                backlightState: { acceptReporters: true, items: ['开', '关'] },
+                cameraSizes: { acceptReporters: true, items: CAMERA_SIZES }
             }
         };
     };
@@ -370,6 +520,29 @@
             } else if (report === 'audio_input') {
                 // 麦克风响度 (0~100), 来自固件上报 0x0D
                 self.micLevelValue = parseInt(msg['value'], 10) || 0;
+            } else if (report === 'camera_info') {
+                // 摄像头状态 (固件上报 0x12)
+                var info = {
+                    width: parseInt(msg['width'], 10) || 0,
+                    height: parseInt(msg['height'], 10) || 0,
+                    quality: msg['quality'],
+                    sizeName: msg['size_name'],
+                    sizeIndex: msg['size_index'],
+                    xclkMhz: msg['xclk_mhz'],
+                    state: msg['state']
+                };
+                self.cameraInfoValue = info;
+                self.cameraInfoAt = Date.now();
+                self.noteCamera(info.width + 'x' + info.height + '（' + info.sizeName +
+                                '） 质量 ' + info.quality + ' XCLK ' + info.xclkMhz + 'MHz');
+            } else if (report === 'camera_status') {
+                // 拍照进度 (固件上报 0x11): 0=空闲 1=开始拍 2=出错
+                if (msg['state_name'] === 'error') {
+                    self.noteCamera('摄像头出错（连续失败 ' + msg['value'] + ' 次），看串口日志');
+                }
+            } else if (report === 'camera_frame') {
+                // 一整帧 JPEG (网关把 0x10 帧头 + 0x0F 分片拼好并 base64 了)
+                self.handlePhoto(msg);
             }
             // 有板子数据回来 = 整条链路 (Scratch→网关→板子→回传) 是通的
             if (self.statusState === 'connecting') {
@@ -799,6 +972,105 @@
 
     Esp32S3.prototype.stopSpeaking = function () {
         this.send({ command: 'audio_tts_stop' }, true);
+    };
+
+    /* 摄像头积木: OV2640 拍照 (命令 0x78~0x7B, 上报 0x0F~0x12) */
+
+    Esp32S3.prototype.cameraSize = function (args) {
+        var index = CAMERA_SIZES.indexOf(String(args.SIZE === undefined ? '' : args.SIZE).toUpperCase());
+        if (index < 0) {
+            index = 1;                    // 认不出来就退回 VGA
+        }
+        this.send({ command: 'camera_config', size: index }, true);
+    };
+
+    Esp32S3.prototype.cameraQuality = function (args) {
+        var quality = parseInt(args.QUALITY, 10);
+        if (!isFinite(quality)) {
+            quality = 20;
+        }
+        if (quality < 0) { quality = 0; }
+        if (quality > 63) { quality = 63; }
+        this.send({ command: 'camera_config', quality: quality }, true);
+    };
+
+    /*
+     * 「拍照」: 发一次 0x79, 等整帧回来并挂成新造型之后再往下走。
+     * 固件里"拍完就断电降温"是默认行为, 所以每次拍照前都要重新上电初始化
+     * (含 2 秒预热), 这一下大概要 3 秒左右, 别当它卡住了。
+     */
+    Esp32S3.prototype.takePhoto = function () {
+        var self = this;
+        var deferred = makeDeferred();
+        this.photoDeferred = deferred;
+        this.noteCamera('正在拍照…（要等板子上电 + 预热，约 3 秒）');
+        this.send({ command: 'camera_snapshot', frames: 1, interval: 0 }, true);
+        return Promise.race([
+            deferred.promise,
+            new Promise(function (resolve) {
+                setTimeout(function () {
+                    if (self.photoDeferred === deferred) {
+                        self.photoDeferred = null;
+                        self.noteCamera('拍照超时：' + (CAMERA_PHOTO_TIMEOUT_MS / 1000) +
+                                        ' 秒没收到照片（看「连接状态」和串口日志）');
+                    }
+                    resolve();
+                }, CAMERA_PHOTO_TIMEOUT_MS);
+            })
+        ]);
+    };
+
+    Esp32S3.prototype.cameraStop = function () {
+        this.send({ command: 'camera_stop' }, true);
+    };
+
+    // 往「摄像头状态」上写一句最近发生的事
+    Esp32S3.prototype.noteCamera = function (text) {
+        this.cameraNote = text;
+        this.cameraNoteAt = Date.now();
+    };
+
+    /*
+     * 「摄像头状态」: 显示最近发生的一件事 —— 拍照结果 / 摄像头出错 / 分辨率。
+     * 报告积木被读取的频率很高 (每帧都在问), 所以顺手刷新的查询做了 2 秒节流:
+     * 拍照刚有结果时不会被"640x480..."立刻顶掉, 过两秒没新消息才会刷新成状态。
+     */
+    Esp32S3.prototype.cameraState = function () {
+        var stale = (Date.now() - this.cameraNoteAt) > CAMERA_INFO_REFRESH_MS;
+        if (this.socketOpen() && !this.photoDeferred && stale) {
+            this.cameraNoteAt = Date.now();      // 先记上, 免得连发一串查询
+            this.send({ command: 'camera_info' }, true);
+        }
+        return this.cameraNote;
+    };
+
+    Esp32S3.prototype.photoData = function () {
+        return this.photoDataUrl;
+    };
+
+    // 收到一整帧: 存下 data URL, 变成当前角色的新造型, 再放行「拍照」积木
+    Esp32S3.prototype.handlePhoto = function (msg) {
+        var self = this;
+        var base64 = msg['data'];
+        if (typeof base64 !== 'string' || !base64) {
+            return;
+        }
+        this.photoDataUrl = 'data:image/jpeg;base64,' + base64;
+        this.photoCount++;
+        var name = '照片 ' + this.photoCount;
+        var waiting = this.photoDeferred;
+        this.photoDeferred = null;
+
+        addPhotoCostume(msg, base64, name).then(function (note) {
+            self.noteCamera(note);
+        }).catch(function (err) {
+            self.noteCamera('照片拿到了，但变成造型失败：' +
+                            (err && err.message ? err.message : err));
+        }).then(function () {
+            if (waiting) {
+                waiting.resolve();       // 造型挂好了, 让积木继续往下走
+            }
+        });
     };
 
     Esp32S3.prototype.digitalRead = function (args) {
