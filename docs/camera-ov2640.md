@@ -52,7 +52,7 @@ OV2640 是 **0x30**, ES8311 是 **0x18** (8 位写法 0x60 / 0x30)。
 | `TMX_CAMERA_ENABLE` | y | 总开关; 关掉后引脚和内存全部还给 Scratch |
 | `TMX_CAMERA_XCLK_PIN` 等 | 见上表 | 各信号线引脚 |
 | `TMX_CAMERA_PWDN_PIN` / `_RESET_PIN` | 48 / -1 | 没接就填 -1 |
-| `TMX_CAMERA_XCLK_FREQ_HZ` | 20000000 | 画面有横条纹/花屏时降到 10~16MHz |
+| `TMX_CAMERA_XCLK_FREQ_HZ` | 20000000 | XCLK 频率。OV2640 的寄存器表是按 24MHz 定的，本工程实际默认 24MHz；画面有横条纹先看 `TMX_CAMERA_WARMUP_MS`，不是 XCLK 的问题（见 [camera-debug-notes.md](camera-debug-notes.md)） |
 | `TMX_CAMERA_XCLK_LEDC_TIMER` / `_CHANNEL` | 1 / 6 | XCLK 占用的 LEDC 资源 |
 | `TMX_CAMERA_FRAMESIZE_*` | VGA | QVGA/VGA/SVGA/XGA/SXGA/UXGA |
 | `CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_CUSTOM` / `_SIZE` | y / 100000 | JPEG 帧缓冲大小；自动算法 `w*h/5` 只有 61KB，画面细节一多整帧就被判 `FB-OVF` 丢掉（组件菜单，不在本工程 Kconfig 里）|
@@ -61,6 +61,8 @@ OV2640 是 **0x30**, ES8311 是 **0x18** (8 位写法 0x60 / 0x30)。
 | 夜间模式（在线切 XCLK） | 24MHz | 想要夜里横纹少一点，用 `python tools\pc_camera_tune.py <ip> --set xclk 12` 把 XCLK 降到 12MHz：帧率约减半、曝光时间上限翻倍，同样亮度下自动增益更低 → 逐行噪声更少（白天想恢复就 `--set xclk 24`）。重启后回到 Kconfig 默认值 |
 | `TMX_CAMERA_GAIN_CEILING` | 3 | 自动增益上限（0=2X … 3=16X … 6=128X）。弱光下压小它噪点更少（画面偏暗），自动曝光会拉长曝光补偿；想要原厂行为填 6。开机还会自动做一次 JPEG 头自检，发现问题就重新初始化传感器 |
 | `TMX_CAMERA_IDLE_POWER_OFF` | y | 空闲时给摄像头断电降温：开机自检后立刻停 XCLK+PWDN 掉电，拍照前重新上电初始化（约 +0.3s），拍完再断电 |
+| `TMX_CAMERA_WARMUP_MS` | **2000** | 上电后预热时长：初始化完先抓帧丢掉不返回，等 AEC/AGC/AWB 收敛再拍。OV2640 上电时自动算法是从默认值逐帧收敛的，头几帧增益拉满、白平衡没收敛；配合上面的"拍完就断电"，不加预热的话**每一张照片都是最脏的第 0 帧**（实测逐行噪声是收敛后的 4.5~8 倍，就是画面上的"很多噪点 + 彩色横纹"）。0 = 关 |
+| `TMX_CAMERA_WARMUP_FRAMES` | 20 | 预热除了等够时间还至少丢掉这么多帧（收敛按帧推进，夜间模式帧率减半时防止时间够了帧不够） |
 | `TMX_CAMERA_PMIC_AVDD_MV` / `TMX_CAMERA_PMIC_DVDD_MV` | 2800 / **1200** | 每次开机把 AXP2101 的 AVDD(BLDO1) / DVDD(BLDO2) 设成这个值并打开。**DVDD 别填 2.8V**：那是 1.2V 内核供电，过压会让模块明显发烫 |
 | `TMX_CAMERA_PMIC_ALDO2_MV` | 2800 | 摄像头 I/O 供电 VDDCAM_3V3 接在 AXP2101 的 **ALDO2** 上，芯片默认是**关的**。不打开时 DVP 高电平只有漏电电压（实测 1.8V），低于 ESP32 判高门限 → 帧数据全乱、拍不出图（SCCB 因为开漏上拉仍能通，很容易误判成模组坏了）。固件开机会把它设成这个电压并打开 |
 | `TMX_CAMERA_PMIC_AXP2101` | y | 开机先把 AXP2101 的 BLDO1(AVDD)/BLDO2(DVDD) 打开 (本板摄像头供电, 只动使能位不改电压)；关掉就完全不动 PMIC |
@@ -133,7 +135,8 @@ python D:\esp\onegpio\tools\pc_camera_check.py 192.168.0.103 --view       # 拍�
 | 日志 `frame buffer malloc failed` | 内存不够: 分辨率降 QVGA, 或 `TMX_CAMERA_FB_COUNT=1` |
 | `--scan` 看不到 0x30 但能看到 0x18 | 问题在摄像头一侧 (板上 I2C 是好的) |
 | 收不到任何帧 (超时) | 板子是不是被网关占着 (先 `stop_s3extend.ps1`); 串口里有没有 "拍照: ..." 日志 |
-| 画面花屏 / 横条纹 / 颜色错乱 | XCLK 降到 10~16MHz; 杜邦线尽量短, 数据线别和电源线绞在一起 |
+| 画面很多噪点 / 彩色横纹 | **`TMX_CAMERA_WARMUP_MS` 是不是被改成 0 了**（上电预热，见下）；其次用 `tools\pc_camera_stripe.py` 量一下行噪声；最后才是杜邦线缩短、数据线别和电源线绞在一起 |
+| 画面花屏 / 整屏噪点 / 颜色错乱 | 先 `--scan` 看 SCCB 有没有 0x30、再确认 VDDCAM_3V3(ALDO2) 有没有开；XCLK 降到 10~16MHz 是以前的老办法，现在先查供电 |
 | 画面很暗 / 偏色 | 正常现象, OV2640 默认增益在弱光下偏暗; 可通过 `sensor_t` 调 `set_brightness/set_gain_ctrl` (暂未做成积木) |
 | 帧数据不完整 (`不是完整的 JPEG`) | 看脚本打印的"分片错位"计数; TCP 上不该丢, 多了说明板子内存被打爆 |
 | 拍照后其它积木变卡 | 连续拍是"边拍边发", 把 `interval` 调大或拍完发 `CAMERA_STOP` |

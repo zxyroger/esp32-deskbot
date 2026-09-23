@@ -945,6 +945,52 @@ static void camera_sensor_off(void)
 #endif
 }
 
+/*
+ * 上电预热: 抓一批帧丢掉, 等 AEC/AGC/AWB 收敛。
+ *
+ * OV2640 上电时 AEC/AGC/AWB 都是从默认值开始逐帧收敛的: 头几帧模拟增益拉满、
+ * 白平衡也没收敛。实测 (VGA / 同一会话连续取帧, 暗部) :
+ *
+ *   第 0 帧  行条纹 3.54  像素噪声 4.91  色偏 61.8
+ *   第 8 帧  行条纹 0.73  像素噪声 2.11  色偏 50.6
+ *   第 19 帧 行条纹 0.82  像素噪声 2.16  色偏 50.8
+ *
+ * 也就是第 0 帧的逐行噪声是稳定后的 4.5 倍 —— 画面上就是"很多噪点 + 彩色横纹"。
+ * 偏偏本固件为了降温是"拍一张就断电" (TMX_CAMERA_IDLE_POWER_OFF), 每次拍照都
+ * 要重新上电, 于是每一张照片拿到的都是这个最脏的第 0 帧。
+ *
+ * 这里在初始化之后、自检和拍照之前先抓掉一批帧。时间 (TMX_CAMERA_WARMUP_MS) 和
+ * 帧数 (TMX_CAMERA_WARMUP_FRAMES) 两个条件都要满足: 收敛按帧推进, 只等时间的话
+ * 夜间模式 (帧率减半) 会等不够帧。
+ */
+static void camera_warm_up(void)
+{
+#if CONFIG_TMX_CAMERA_WARMUP_MS > 0 || CONFIG_TMX_CAMERA_WARMUP_FRAMES > 0
+    const int64_t deadline = esp_timer_get_time() +
+                              (int64_t)CONFIG_TMX_CAMERA_WARMUP_MS * 1000;
+    /* 兜底: 传感器不出帧时别把拍照卡死在这里 */
+    const int64_t give_up = deadline + 5000000LL;
+    int frames = 0;
+
+    while (frames < CONFIG_TMX_CAMERA_WARMUP_FRAMES ||
+           esp_timer_get_time() < deadline) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb != NULL) {
+            esp_camera_fb_return(fb);
+            frames++;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        if (esp_timer_get_time() > give_up) {
+            ESP_LOGW(TAG, "预热超时: 只抓掉 %d 帧, 继续拍照", frames);
+            return;
+        }
+    }
+    ESP_LOGI(TAG, "预热: 丢掉 %d 帧 (等 %d ms), AEC/AGC/AWB 已收敛",
+             frames, CONFIG_TMX_CAMERA_WARMUP_MS);
+#endif
+}
+
 esp_err_t tmx_camera_init(void)
 {
     if (s_ready && s_sensor_on) {
@@ -1076,6 +1122,9 @@ esp_err_t tmx_camera_init(void)
     /* 弱光降噪: 压住自动增益上限, 让 AEC 用曝光时间(而不是增益)去补偿;
      * 同时把在线调过的参数重新套一遍 (空闲断电会重置传感器)。 */
     apply_tuned_settings(sensor);
+
+    /* 上电预热: 自检和拍照都得等自动算法收敛, 否则拿到的是最脏的第 0 帧 */
+    camera_warm_up();
 
 #if CONFIG_TMX_CAMERA_PIN_PROBE
     cam_probe_all_pins();
