@@ -23,7 +23,14 @@ import os
 import subprocess
 import sys
 
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:  # 本机系统 Python 里没有 Pillow, ESP-IDF 自带的有
+    print("这个脚本需要 Pillow (PIL), 而当前用的 Python 里没装。两种办法:")
+    print(r"  1) 用 ESP-IDF 自带的 Python 跑 (已经装好 Pillow):")
+    print(r"     C:\Espressif\tools\python\v5.5.4\venv\Scripts\python.exe tools\pc_camera_merge.py ...")
+    print(r"  2) 给系统 Python 装一个:  python -m pip install pillow")
+    sys.exit(2)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
