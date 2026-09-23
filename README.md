@@ -216,11 +216,12 @@ Get-NetTCPConnection -State Listen | Where-Object LocalPort -in 43124,43125,9007
 | 麦克风响度 | `audio_mic` (0x74) + 上报 0x0D | 读麦克风 0~100，需要先用「麦克风检测 开」打开 |
 | 朗读文字 | `audio_tts` (0x75) | 板子本地做中文语音合成（esp-tts），文字由网关按 UTF-8 拆包 |
 | 停止朗读 | `audio_tts_stop` (0x76) | 立刻停止朗读 |
-| 拍照尺寸 | `camera_config` (0x78) | QVGA / VGA / SVGA / XGA / SXGA / UXGA，拍之前发一条即可 |
-| 拍照质量 | `camera_config` (0x78) | 0~63，越小越清晰（帧也越大） |
-| 拍照（照片变成新造型） | `camera_snapshot` (0x79) | 等整帧回来并挂成**当前角色的新造型**再往下走；固件"拍完就断电降温"，所以每次约 3 秒 |
-| 停止拍照 | `camera_stop` (0x7A) | 丢掉正在发的那一帧 |
-| 摄像头状态 | `camera_info` (0x7B) + 上报 0x12 | 显示最近一件事：拍照结果 / 分辨率质量 XCLK / 出错提示 |
+| 摄像头尺寸 | `camera_config` (0x78) | QVGA / VGA / SVGA / XGA / SXGA / UXGA；**流式播放建议 QVGA** |
+| 摄像头质量 | `camera_config` (0x78) | 0~63，越小越清晰（帧越大、越占带宽） |
+| **打开摄像头（画面显示在当前角色上）** | `camera_snapshot` (0x79, 帧数=0) | **流式播放**：板子连续出图，每帧原地刷到当前角色的「摄像头画面」造型上（不新建造型） |
+| 关闭摄像头 | `camera_stop` (0x7A) | 停止出图并给摄像头断电降温；点编辑器的停止按钮也会自动停 |
+| 拍一张照片（变成新造型） | `camera_snapshot` (0x79, 帧数=1) | 摄像头开着时 = 截当前画面（瞬时）；关着时单独拍一张（上电 + 预热，约 3 秒） |
+| 摄像头状态 | `camera_info` (0x7B) + 上报 0x12 | 显示最近一件事：视频帧率 / 拍照结果 / 分辨率质量 XCLK / 出错提示 |
 | 照片（数据 URL） | —— | 最近一张照片的 `data:image/jpeg;base64,...` |
 
 另外固件还实现了协议层的 I2C 读写、输入上报开关、模拟扫描间隔、固件版本查询、

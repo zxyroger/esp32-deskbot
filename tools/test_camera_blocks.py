@@ -17,6 +17,7 @@
 用法 (用系统 Python, 它才有 python_banyan / s3-extend):
     C:\\Program Files\\Python313\\python.exe tools\\test_camera_blocks.py --host 192.168.0.103
     ... --host 192.168.0.103 --size VGA --quality 20 --frames 2
+    ... --host 192.168.0.103 --size QVGA --seconds 8      # 流式播放: 测 8 秒能到多少帧/秒
 
 跑之前先把 s3-extend 起起来 (tools\\start_s3extend.ps1), 并且别让板子被
 别的客户端占着 (tools\\stop_s3extend.ps1 会停掉整条服务)。
@@ -75,6 +76,8 @@ def main():
                         help="先切分辨率: QVGA/VGA/SVGA/XGA/SXGA/UXGA 或 0~5")
     parser.add_argument("--quality", type=int, default=None, help="JPEG 质量 0~63")
     parser.add_argument("--frames", type=int, default=1, help="拍几帧 (默认 1)")
+    parser.add_argument("--seconds", type=float, default=0,
+                        help="改成流式播放: 连续收这么多秒再停 (优先于 --frames)")
     parser.add_argument("--interval", type=int, default=0, help="帧间隔 ms (0=固件默认)")
     parser.add_argument("--out", default="scratch_photo", help="保存文件前缀")
     parser.add_argument("--dir", default=".", help="保存目录")
@@ -106,13 +109,19 @@ def main():
         bus.send(cfg)
         time.sleep(0.6)
 
+    streaming = args.seconds > 0
+    wanted = 0 if streaming else args.frames
     bus.send({"command": "camera_info"})
-    bus.send({"command": "camera_snapshot", "frames": args.frames, "interval": args.interval})
+    bus.send({"command": "camera_snapshot",
+              "frames": 0 if streaming else args.frames,
+              "interval": args.interval})
 
     got = []
-    deadline = time.time() + args.timeout
+    started = time.time()
+    deadline = started + (args.seconds if streaming else args.timeout)
     info = None
-    while time.time() < deadline and len(got) < args.frames:
+    total_bytes = 0
+    while time.time() < deadline and (streaming or len(got) < wanted):
         msg = bus.recv(0.5)
         if msg is None:
             continue
@@ -129,14 +138,25 @@ def main():
             print("camera_status: %s (值 %s)" % (msg.get("state_name"), msg.get("value")))
         elif report == "camera_frame":
             raw = base64.b64decode(msg["data"])
-            path = os.path.join(args.dir, "%s_%03d.jpg" % (args.out, msg.get("index", len(got))))
-            with open(path, "wb") as handle:
-                handle.write(raw)
+            total_bytes += len(raw)
+            # 流式播放会有几百帧, 别全写盘; 只存前 3 帧留个证据
+            path = ""
+            if len(got) < 3:
+                path = os.path.join(args.dir, "%s_%03d.jpg" % (args.out, msg.get("index", len(got))))
+                with open(path, "wb") as handle:
+                    handle.write(raw)
             ok = raw[:2] == b"\xff\xd8" and raw[-2:] == b"\xff\xd9"
-            print("camera_frame: 第 %s 帧 %sx%s %d 字节 -> %s%s"
-                  % (msg.get("index"), msg.get("width"), msg.get("height"), len(raw), path,
-                     "" if ok else "  (警告: 不是完整 JPEG!)"))
-            got.append(path)
+            if streaming:
+                got.append(None)
+                if len(got) in (1, 3) or len(got) % 30 == 0:
+                    print("  第 %d 帧: %sx%s %d 字节%s"
+                          % (len(got), msg.get("width"), msg.get("height"), len(raw),
+                             "" if ok else "  (警告: 不是完整 JPEG!)"))
+            else:
+                print("camera_frame: 第 %s 帧 %sx%s %d 字节 -> %s%s"
+                      % (msg.get("index"), msg.get("width"), msg.get("height"), len(raw), path,
+                         "" if ok else "  (警告: 不是完整 JPEG!)"))
+                got.append(path)
         else:
             print("其它报告: %s" % report)
 
@@ -144,8 +164,19 @@ def main():
     bus.close()
 
     print()
-    if len(got) < args.frames:
-        print("结果: 只收到 %d/%d 帧 —— 链路没通。检查:" % (len(got), args.frames))
+    elapsed = time.time() - started
+    if streaming:
+        fps = len(got) / elapsed if elapsed > 0 else 0
+        kbs = total_bytes / 1024 / elapsed if elapsed > 0 else 0
+        print("结果: %.1f 秒收到 %d 帧 = %.1f 帧/秒, 平均 %.1f KB/秒 (%.1f KB/帧)"
+              % (elapsed, len(got), fps, kbs, kbs / fps if fps else 0))
+        if len(got) == 0:
+            print("一帧都没收到 —— 链路没通, 先按 --frames 1 试单张")
+            return 1
+        return 0
+
+    if len(got) < wanted:
+        print("结果: 只收到 %d/%d 帧 —— 链路没通。检查:" % (len(got), wanted))
         print("  * s3-extend 起来了吗 (tools\\start_s3extend.ps1, 看 9007/43124/43125 在不在)"
               " / 板子是不是被别的客户端占着")
         if info is None:

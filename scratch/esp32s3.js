@@ -60,6 +60,10 @@
     var CAMERA_SIZES = ['QVGA', 'VGA', 'SVGA', 'XGA', 'SXGA', 'UXGA'];
     var CAMERA_PHOTO_TIMEOUT_MS = 20000;   // 「拍照」积木最多等这么久
     var CAMERA_INFO_REFRESH_MS = 2000;     // 「摄像头状态」的查询/显示节流
+    // 流式播放: 板子两帧之间的最小间隔 (实际帧率还受 WiFi / 解码速度限制)。
+    // 想更流畅就把「摄像头尺寸」设成 QVGA —— 一帧只有 VGA 的 1/4。
+    var CAMERA_STREAM_INTERVAL_MS = 80;
+    var VIDEO_COSTUME_NAME = '摄像头画面';
 
     // 引脚模式编号 (与固件/telemetrix 协议一致)
     var AT_OUTPUT = 1;
@@ -107,6 +111,17 @@
         // 「摄像头状态」积木显示的就是最近发生的这一件事 (拍照结果 / 出错 / 分辨率)
         this.cameraNote = '还没拍过（点「拍照」试试）';
         this.cameraNoteAt = 0;
+        // 流式播放 (打开摄像头 -> 每帧原地更新同一个造型)
+        this.videoOn = false;
+        this.videoCostume = null;           // 正在被刷新的那个造型对象
+        this.videoLastCanvas = null;        // 最后一帧画布, 关闭时把资源刷成它
+        this.videoLastFrame = null;         // 最后一帧的原始消息 (视频中"截图"用)
+        this.videoBusy = false;             // 上一帧还没画完
+        this.videoFrames = 0;               // 画了多少帧
+        this.videoDropped = 0;              // 因为上一帧没画完而丢掉的帧
+        this.videoFps = 0;
+        this.videoFpsAt = 0;
+        this.videoFpsCount = 0;
     }
 
     // 把状态拼成一句给人看的话。
@@ -167,11 +182,10 @@
     }
 
     /*
-     * 板子给的是 JPEG, 而 Scratch 的位图造型是 PNG —— 先过一遍 canvas 转成 PNG。
-     * (和 Scratch 自己"上传一张 jpg"时做的事一样: 直接塞 JPEG 资源虽然浏览器
-     *  多半也能画出来, 但 DataFormat 和渲染器的假设对不上, 不保险。)
+     * 板子给的是 JPEG。先解成 canvas: 拍照片那条路要转 PNG 存资源,
+     * 流式播放那条路直接把 canvas 交给渲染器换贴图 (不新建造型)。
      */
-    function jpegToPngBytes(base64) {
+    function decodeJpegToCanvas(base64) {
         return new Promise(function (resolve, reject) {
             var image = new Image();
             image.onload = function () {
@@ -179,20 +193,49 @@
                 canvas.width = image.width;
                 canvas.height = image.height;
                 canvas.getContext('2d').drawImage(image, 0, 0);
-                canvas.toBlob(function (blob) {
-                    if (!blob) {
-                        reject(new Error('照片转 PNG 失败'));
-                        return;
-                    }
-                    var reader = new FileReader();
-                    reader.onload = function () { resolve(new Uint8Array(reader.result)); };
-                    reader.onerror = function () { reject(new Error('照片转 PNG 读回失败')); };
-                    reader.readAsArrayBuffer(blob);
-                }, 'image/png');
+                resolve(canvas);
             };
-            image.onerror = function () { reject(new Error('照片解码失败')); };
+            image.onerror = function () { reject(new Error('画面解码失败')); };
             image.src = 'data:image/jpeg;base64,' + base64;
         });
+    }
+
+    function canvasToPngBytes(canvas) {
+        return new Promise(function (resolve, reject) {
+            canvas.toBlob(function (blob) {
+                if (!blob) {
+                    reject(new Error('画面转 PNG 失败'));
+                    return;
+                }
+                var reader = new FileReader();
+                reader.onload = function () { resolve(new Uint8Array(reader.result)); };
+                reader.onerror = function () { reject(new Error('画面转 PNG 读回失败')); };
+                reader.readAsArrayBuffer(blob);
+            }, 'image/png');
+        });
+    }
+
+    /*
+     * 板子给的是 JPEG, 而 Scratch 的位图造型是 PNG —— 先过一遍 canvas 转成 PNG。
+     * (和 Scratch 自己"上传一张 jpg"时做的事一样: 直接塞 JPEG 资源虽然浏览器
+     *  多半也能画出来, 但 DataFormat 和渲染器的假设对不上, 不保险。)
+     */
+    function jpegToPngBytes(base64) {
+        return decodeJpegToCanvas(base64).then(canvasToPngBytes);
+    }
+
+    // 在当前角色上找一个叫这个名的造型 (流式播放要复用它, 不能每帧都新建)
+    function findCostume(target, name) {
+        if (!target || !target.sprite || !target.sprite.costumes) {
+            return null;
+        }
+        var costumes = target.sprite.costumes;
+        for (var i = 0; i < costumes.length; i++) {
+            if (costumes[i] && costumes[i].name === name) {
+                return costumes[i];
+            }
+        }
+        return null;
     }
 
     /*
@@ -236,6 +279,65 @@
                 return vm.addCostume(costume.md5, costume, vm.editingTarget.id);
             }).then(function () {
                 resolve('已把「' + name + '」加为造型');
+            }).catch(reject);
+        });
+    }
+
+    /*
+     * 流式播放: 把一帧画到舞台上。
+     *
+     * 关键点是**不能每帧新建造型** —— 15fps 跑一分钟就是 900 个造型, 编辑器会卡死。
+     * 所以第一帧用 vm.addCostume 建一个固定名字的造型, 之后每一帧都只是
+     * renderer.updateBitmapSkin() 原地换贴图, 造型数量不变、内存不涨。
+     * 代价是资源的 assetId 还停在第一帧, 所以关闭摄像头时会再刷一次资源
+     * (见 refreshVideoAsset), 这样工程存档里存的是最后一帧而不是第一帧。
+     */
+    function renderVideoFrame(msg) {
+        return new Promise(function (resolve, reject) {
+            var vm = Scratch.vm;
+            if (!vm || !vm.runtime || !vm.runtime.renderer || !vm.runtime.storage ||
+                    !vm.editingTarget || !vm.editingTarget.sprite) {
+                reject(new Error('拿不到编辑器内部接口（要用 TurboWarp 这类支持非沙箱扩展的编辑器）'));
+                return;
+            }
+            var width = parseInt(msg['width'], 10) || 0;
+            var height = parseInt(msg['height'], 10) || 0;
+            var resolution = 2;     // 与"照片造型"一致: 640x480 在舞台上占 320x240
+            var center = [width / 2 / resolution, height / 2 / resolution];
+
+            decodeJpegToCanvas(msg['data']).then(function (canvas) {
+                var renderer = vm.runtime.renderer;
+                var existing = findCostume(vm.editingTarget, VIDEO_COSTUME_NAME);
+                if (existing) {
+                    renderer.updateBitmapSkin(existing.skinId, canvas, resolution, center);
+                    existing.size = [width, height];
+                    existing.rotationCenterX = width / 2;
+                    existing.rotationCenterY = height / 2;
+                    existing.bitmapResolution = resolution;
+                    resolve({ costume: existing, canvas: canvas });
+                    return;
+                }
+                // 第一帧: 存成 PNG 资源, 挂一个固定名字的造型
+                canvasToPngBytes(canvas).then(function (bytes) {
+                    var storage = vm.runtime.storage;
+                    var asset = storage.createAsset(storage.AssetType.ImageBitmap,
+                                                    storage.DataFormat.PNG,
+                                                    bytes, null, true);
+                    var costume = {
+                        name: VIDEO_COSTUME_NAME,
+                        asset: asset,
+                        assetId: asset.assetId,
+                        dataFormat: storage.DataFormat.PNG,
+                        md5: asset.assetId + '.' + storage.DataFormat.PNG,
+                        bitmapResolution: resolution,
+                        rotationCenterX: width / 2,
+                        rotationCenterY: height / 2
+                    };
+                    return vm.addCostume(costume.md5, costume, vm.editingTarget.id)
+                        .then(function () {
+                            resolve({ costume: costume, canvas: canvas });
+                        });
+                }).catch(reject);
             }).catch(reject);
         });
     }
@@ -375,7 +477,7 @@
                 {
                     opcode: 'cameraSize',
                     blockType: Scratch.BlockType.COMMAND,
-                    text: '拍照尺寸 [SIZE]',
+                    text: '摄像头尺寸 [SIZE]',
                     arguments: {
                         SIZE: {
                             type: Scratch.ArgumentType.STRING,
@@ -387,21 +489,27 @@
                 {
                     opcode: 'cameraQuality',
                     blockType: Scratch.BlockType.COMMAND,
-                    text: '拍照质量 [QUALITY]',
+                    text: '摄像头质量 [QUALITY]',
                     arguments: {
                         QUALITY: { type: Scratch.ArgumentType.NUMBER, defaultValue: 20 }
                     }
                 },
                 {
-                    opcode: 'takePhoto',
+                    opcode: 'openVideo',
                     blockType: Scratch.BlockType.COMMAND,
-                    text: '拍照（照片变成新造型）',
+                    text: '打开摄像头（画面显示在当前角色上）',
                     arguments: {}
                 },
                 {
-                    opcode: 'cameraStop',
+                    opcode: 'closeVideo',
                     blockType: Scratch.BlockType.COMMAND,
-                    text: '停止拍照',
+                    text: '关闭摄像头',
+                    arguments: {}
+                },
+                {
+                    opcode: 'takePhoto',
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: '拍一张照片（变成新造型）',
                     arguments: {}
                 },
                 {
@@ -488,6 +596,9 @@
 
         this.socket.onclose = function () {
             self.connected = false;
+            // 本地服务断了: 板子那边会自己停流 (发不出去就收工), 这边把状态对上
+            self.videoOn = false;
+            self.videoBusy = false;
             // 正在等启动器拉起服务时, 别把"正在启动"盖成"未连接"
             if (self.launching) {
                 self.setStatus('starting');
@@ -542,7 +653,11 @@
                 }
             } else if (report === 'camera_frame') {
                 // 一整帧 JPEG (网关把 0x10 帧头 + 0x0F 分片拼好并 base64 了)
-                self.handlePhoto(msg);
+                if (self.videoOn) {
+                    self.handleVideoFrame(msg);
+                } else {
+                    self.handlePhoto(msg);
+                }
             }
             // 有板子数据回来 = 整条链路 (Scratch→网关→板子→回传) 是通的
             if (self.statusState === 'connecting') {
@@ -995,12 +1110,80 @@
     };
 
     /*
-     * 「拍照」: 发一次 0x79, 等整帧回来并挂成新造型之后再往下走。
-     * 固件里"拍完就断电降温"是默认行为, 所以每次拍照前都要重新上电初始化
-     * (含 2 秒预热), 这一下大概要 3 秒左右, 别当它卡住了。
+     * 「打开摄像头」: 让板子连续出图 (0x79 帧数=0), 每一帧原地刷到当前角色的
+     * 「摄像头画面」造型上, 就是舞台上看到的实时画面。
+     *
+     * 打开要一次上电 + 预热 (约 3 秒), 之后的帧才是连续的 —— 所以这块积木
+     * 不等, 开完立刻往下走; 画面过几秒就会出现。
+     * 用「关闭摄像头」停, 或者点编辑器的停止按钮 (会自动停)。
+     */
+    Esp32S3.prototype.openVideo = function () {
+        if (this.videoOn) {
+            return;
+        }
+        this.videoOn = true;
+        this.videoBusy = false;
+        this.videoFrames = 0;
+        this.videoDropped = 0;
+        this.videoFps = 0;
+        this.videoFpsCount = 0;
+        this.videoFpsAt = Date.now();
+        this.noteCamera('正在打开摄像头…（板子上电 + 预热，约 3 秒）');
+        this.send({ command: 'camera_snapshot', frames: 0, interval: CAMERA_STREAM_INTERVAL_MS },
+                  true);
+    };
+
+    Esp32S3.prototype.closeVideo = function () {
+        if (!this.videoOn) {
+            return;
+        }
+        this.videoOn = false;
+        this.videoBusy = false;
+        this.send({ command: 'camera_stop' }, true);
+        this.noteCamera('摄像头已关闭');
+        this.refreshVideoAsset();
+    };
+
+    // 把「摄像头画面」造型的资源刷成最后一帧 (不然存档里存的是打开时的第一帧)
+    Esp32S3.prototype.refreshVideoAsset = function () {
+        var vm = Scratch.vm;
+        var canvas = this.videoLastCanvas;
+        if (!vm || !vm.runtime || !vm.runtime.storage || !canvas) {
+            return;
+        }
+        var costume = findCostume(vm.editingTarget, VIDEO_COSTUME_NAME);
+        if (!costume) {
+            return;
+        }
+        canvasToPngBytes(canvas).then(function (bytes) {
+            var storage = vm.runtime.storage;
+            costume.asset = storage.createAsset(storage.AssetType.ImageBitmap,
+                                                storage.DataFormat.PNG, bytes, null, true);
+            costume.dataFormat = storage.DataFormat.PNG;
+            costume.assetId = costume.asset.assetId;
+            costume.md5 = costume.assetId + '.' + costume.dataFormat;
+        }).catch(function () { /* 存档时大不了还是第一帧, 不值得打扰用户 */ });
+    };
+
+    /*
+     * 「拍一张照片」: 变成一个新造型, 而且会等造型挂好了才往下走。
+     *
+     * 摄像头正开着的时候直接拿当前这一帧 (瞬时, 不用再拍一次);
+     * 关着的时候让板子单独拍一张 —— 那要重新上电 + 预热, 约 3 秒。
      */
     Esp32S3.prototype.takePhoto = function () {
         var self = this;
+        if (this.videoOn && this.videoLastFrame) {
+            var frame = this.videoLastFrame;
+            this.photoDataUrl = 'data:image/jpeg;base64,' + frame['data'];
+            this.photoCount++;
+            var shotName = '照片 ' + this.photoCount;
+            return addPhotoCostume(frame, frame['data'], shotName).then(function (note) {
+                self.noteCamera(note);
+            }).catch(function (err) {
+                self.noteCamera('截图失败：' + (err && err.message ? err.message : err));
+            });
+        }
         var deferred = makeDeferred();
         this.photoDeferred = deferred;
         this.noteCamera('正在拍照…（要等板子上电 + 预热，约 3 秒）');
@@ -1020,10 +1203,6 @@
         ]);
     };
 
-    Esp32S3.prototype.cameraStop = function () {
-        this.send({ command: 'camera_stop' }, true);
-    };
-
     // 往「摄像头状态」上写一句最近发生的事
     Esp32S3.prototype.noteCamera = function (text) {
         this.cameraNote = text;
@@ -1037,7 +1216,8 @@
      */
     Esp32S3.prototype.cameraState = function () {
         var stale = (Date.now() - this.cameraNoteAt) > CAMERA_INFO_REFRESH_MS;
-        if (this.socketOpen() && !this.photoDeferred && stale) {
+        // 流式播放时状态文字由 fps 每秒刷新, 不用再去问板子
+        if (this.socketOpen() && !this.photoDeferred && !this.videoOn && stale) {
             this.cameraNoteAt = Date.now();      // 先记上, 免得连发一串查询
             this.send({ command: 'camera_info' }, true);
         }
@@ -1073,6 +1253,45 @@
         });
     };
 
+    // 流式播放: 一帧到了就原地换贴图。上一帧还没画完就直接丢掉新帧 ——
+    // 宁可掉帧也不要排队积压 (积压会让画面越来越滞后, 像卡带一样)。
+    Esp32S3.prototype.handleVideoFrame = function (msg) {
+        var self = this;
+        if (!this.videoOn) {
+            return;
+        }
+        this.videoLastFrame = msg;
+        if (this.videoBusy) {
+            this.videoDropped++;
+            return;
+        }
+        this.videoBusy = true;
+        renderVideoFrame(msg).then(function (result) {
+            if (!self.videoOn) {
+                return;                  // 画的途中被关掉了
+            }
+            self.videoCostume = result.costume;
+            self.videoLastCanvas = result.canvas;
+            self.videoFrames++;
+            self.videoFpsCount++;
+            var now = Date.now();
+            var elapsed = now - self.videoFpsAt;
+            if (elapsed >= 1000) {
+                self.videoFps = Math.round(self.videoFpsCount * 1000 / elapsed);
+                self.videoFpsCount = 0;
+                self.videoFpsAt = now;
+                self.noteCamera('视频中：' + self.videoFps + ' 帧/秒' +
+                                (self.videoDropped ? '（丢掉 ' + self.videoDropped + ' 帧）' : ''));
+                self.videoDropped = 0;
+            }
+        }).catch(function (err) {
+            self.videoOn = false;
+            self.noteCamera('视频显示失败：' + (err && err.message ? err.message : err));
+        }).then(function () {
+            self.videoBusy = false;
+        });
+    };
+
     Esp32S3.prototype.digitalRead = function (args) {
         var pin = this.pin(args.PIN);
         if (this.pinModes[pin] !== AT_INPUT_PULLUP) {
@@ -1102,5 +1321,22 @@
         return this.sonarDistances[trig] === undefined ? 0 : this.sonarDistances[trig];
     };
 
-    Scratch.extensions.register(new Esp32S3());
+    var extensionInstance = new Esp32S3();
+
+    /*
+     * 点编辑器的停止按钮时, 顺手把板子的流也停掉 —— 指令停了画面还在放、
+     * 板子还在发热, 是个很容易忘的坑。拿不到 runtime 就算了 (沙箱环境)。
+     */
+    try {
+        var runtime = Scratch.vm && Scratch.vm.runtime;
+        if (runtime && typeof runtime.on === 'function') {
+            runtime.on('PROJECT_STOP_ALL', function () {
+                extensionInstance.closeVideo();
+            });
+        }
+    } catch (ignored) {
+        /* 没有 vm 的编辑器: 靠「关闭摄像头」积木自己停 */
+    }
+
+    Scratch.extensions.register(extensionInstance);
 })(Scratch);

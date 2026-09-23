@@ -183,7 +183,19 @@ static void camera_power_on(void)
 #endif
 
 #define CAM_CHUNK_MAX        240  /* 单包 JPEG 数据上限 (包长字节最大 255) */
-#define CAM_CHUNKS_PER_POLL  16   /* 每轮最多发几片, 免得长时间占住主循环 */
+/*
+ * 每轮最多发几片。
+ *
+ * 原来写的是 16, 想着"别长时间占住主循环"。但流式播放实测下来瓶颈正好在这里:
+ * 主循环每轮只推 16*246 = 3.9KB, 而板子到 PC 的往返有 ~18ms, lwIP 的发送窗口
+ * (CONFIG_LWIP_TCP_SND_BUF_DEFAULT) 又只有 5.7KB —— 窗口一填满就得等 ACK,
+ * 实测卡在 60KB/s 左右 (QVGA 7 帧/秒、VGA 3.6 帧/秒)。
+ *
+ * 现在一轮把整帧推出去 (VGA 约 75 片, XGA 以上一轮推不完就下一轮接着推),
+ * 同时把发送窗口放大到 32KB, 让数据能一直在路上。
+ * tmx_core_send() 本来就是"整包发完才返回", 所以这里只是少绕几圈主循环。
+ */
+#define CAM_CHUNKS_PER_POLL  96
 
 static const framesize_t s_frame_sizes[] = {
     FRAMESIZE_QVGA,   /* 0: 320x240  */
