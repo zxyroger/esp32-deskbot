@@ -30,7 +30,7 @@ OV2640 是 **0x30**, ES8311 是 **0x18** (8 位写法 0x60 / 0x30)。
 | GPIO 1/2 | SCCB (与 I2C 积木共用, 本来就被音频占着) | 同上 |
 | ADC1 的 GPIO3~GPIO9 | DVP 数据/同步脚, 不再能做模拟输入 | 同上 |
 | LEDC 定时器 1 + 通道 6 | XCLK (20MHz) | 同上, 或换 `TMX_CAMERA_XCLK_LEDC_*` |
-| 内部 RAM 约 92KB | VGA 帧缓冲 61KB + DMA 缓冲 32KB | 降分辨率 / `FB_COUNT=1` / 开 PSRAM |
+| PSRAM 约 132KB | VGA 帧缓冲 100KB + DMA 缓冲 32KB | 已经开在 **8MB Octal PSRAM** 上，不占内部 RAM；关掉 `CONFIG_SPIRAM` 就会退回内部 RAM |
 
 **对 Scratch 的影响**:
 

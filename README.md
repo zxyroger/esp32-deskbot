@@ -378,8 +378,9 @@ python D:\esp\onegpio\tools\pc_camera_check.py 192.168.0.103 --scan       # 扫 
 
 * **13 个 GPIO 归它**（3~9 / 15~18 / 48），Scratch 里选这些脚会被拒绝；
 * **模拟输入没了**：Scratch 的模拟引脚 32~39 对应 GPIO1~GPIO6，全被摄像头/I2C 占掉；
-* **约 92KB 内部 RAM**（VGA 帧缓冲 61KB + DMA 缓冲 32KB，本板没开 PSRAM），
-  内存不够就把分辨率降到 QVGA 或把 `TMX_CAMERA_FB_COUNT` 保持 1。
+* **约 132KB 内存**（VGA JPEG 帧缓冲 100KB + DMA 缓冲 32KB）。固件默认打开了
+  **8MB Octal PSRAM**（`CONFIG_SPIRAM`），这笔内存落在 PSRAM 上、不挤占内部 RAM；
+  关掉 PSRAM 就会退回内部 RAM，那时要把分辨率降到 QVGA 或保持 `TMX_CAMERA_FB_COUNT=1`。
 
 接线、协议字段、帧率说明和排障见 [docs/camera-ov2640.md](docs/camera-ov2640.md)。
 

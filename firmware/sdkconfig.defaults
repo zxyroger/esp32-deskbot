@@ -5,6 +5,26 @@
 
 CONFIG_IDF_TARGET="esp32s3"
 
+# 板载 8MB Octal PSRAM (esptool 报 "Embedded PSRAM 8MB (AP_3v3)", 即 N16R8)。
+# 开它的收益很实在, 见 docs/camera-debug-notes.md 的"帧率优化 (2026-09-24)":
+#   * 相机帧缓冲 (100KB) 从内部 RAM 搬到 PSRAM -> 腾出内部 RAM 给 WiFi/lwIP;
+#   * 于是 lwIP 的 TCP 发送窗口才敢放大 (下面 LWIP_TCP_SND_BUF_DEFAULT),
+#     板子到 PC 的吞吐从 ~90KB/s 提到 200KB/s 以上;
+#   * 往返延迟也从 18ms 降到 12ms。
+# 注意: 打开 SPIRAM 会自动带上 STDATOMIC_S32C1I_SPIRAM_WORKAROUND
+# (加 -mdisable-hardware-atomics, 由 newlib 里一个专门文件补 __atomic_*),
+# 如果之前是增量构建, 这里需要 idf.py fullclean 之后重新编译, 否则链接会报
+# "undefined reference to __atomic_compare_exchange_4"。
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# TCP 发送窗口: 默认 5760 (=4*MSS) 对"连续小包回传"太小, 实测卡在 ~90KB/s。
+# 有 PSRAM 撑腰之后放大到 32KB, 相机流式播放吞吐翻倍。
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+
 # 板载 I2C 总线: SDA=GPIO1 / SCL=GPIO2 (总线上挂着 ES8311 音频 codec, 地址 0x30)
 CONFIG_TMX_I2C_SDA_PIN=1
 CONFIG_TMX_I2C_SCL_PIN=2
@@ -37,15 +57,15 @@ CONFIG_TMX_CAMERA_D7_PIN=9
 CONFIG_TMX_CAMERA_XCLK_FREQ_HZ=24000000
 CONFIG_TMX_CAMERA_XCLK_LEDC_TIMER=1
 CONFIG_TMX_CAMERA_XCLK_LEDC_CHANNEL=6
-# VGA + 1 份帧缓冲 (本板没开 PSRAM, 帧缓冲/DMA 缓冲都在内部 RAM:
-# VGA 约 61KB 帧缓冲 + 32KB DMA; 内存够就改 FB_COUNT=2 换更流畅)
+# VGA + 1 份帧缓冲。开了 PSRAM 之后帧缓冲落在 PSRAM, 不再挤占内部 RAM;
+# 想更流畅可以改 FB_COUNT=2 (再吃 100KB PSRAM, 对帧率帮助有限 —— 瓶颈在网络不在采集)
 CONFIG_TMX_CAMERA_FRAMESIZE_VGA=y
 CONFIG_TMX_CAMERA_JPEG_QUALITY=12
 CONFIG_TMX_CAMERA_FB_COUNT=1
 CONFIG_TMX_CAMERA_STREAM_INTERVAL_MS=200
 # JPEG 帧缓冲改成本地指定的大小: 自动算法是 w*h/5 = 61KB, 碰到细节多的画面
 # (VGA + 质量 20 实测能到 ~80KB) 会被驱动判成 FB-OVF 整帧丢掉;
-# 这里给 100KB, 内部 RAM 够放 (本板没开 PSRAM)
+# 这里给 100KB (开了 PSRAM 之后它落在 PSRAM)
 CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE_CUSTOM=y
 CONFIG_CAMERA_JPEG_MODE_FRAME_SIZE=100000
 # 排障用: 上电量一遍 DVP 各信号线的活动 (平时保持 n)

@@ -629,3 +629,72 @@ C:\Program Files\Python313\python.exe tools\test_camera_blocks.py --host 192.168
 > 想再往上走只有两个方向: **(a)** 板子侧继续压小帧(加 QQVGA 之类的档位),
 > **(b)** 把 TCP 发送窗口 / 分段池一起调(先开 PSRAM 再试)。现在 QVGA 14 帧/秒
 > 对"机器人摄像头预览"够用了。
+
+## 开 PSRAM 才是真正的那把钥匙 (2026-09-24 下午)
+
+上面那句"先开 PSRAM 再试"当天就验证了 —— **这块板子本来就有 8MB PSRAM, 只是
+固件没开**。esptool 一眼就能看出来:
+
+```
+$ python -m esptool --port COM14 flash_id
+Chip is ESP32-S3 (QFN56) (revision v0.2)
+Features: WiFi, BLE, Embedded PSRAM 8MB (AP_3v3)      <- 8MB Octal PSRAM (N16R8)
+```
+
+而 `sdkconfig` 里是 `# CONFIG_SPIRAM is not set` —— 纯粹是没打开。
+
+### 怎么开 (以及那个坑)
+
+```
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y          # 8MB 的是 Octal; 2MB 的那种才是 Quad
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+```
+
+**坑**: 打开 SPIRAM 会自动带上 `STDATOMIC_S32C1I_SPIRAM_WORKAROUND`, 它给整个
+工程加 `-mdisable-hardware-atomics`, 于是 GCC 不再内联原子操作, 改成调
+`__atomic_compare_exchange_4` 之类; 这些符号由 newlib 里一个专门的文件提供,
+而**增量构建不会重新编它** —— 结果链接阶段报一屏
+`undefined reference to __atomic_compare_exchange_4`。
+解决: `idf.py fullclean` 之后重新编译 (本工程因为 managed_components 打过补丁,
+fullclean 会被保护拦住, 那就先手动删掉 `firmware/build` 目录)。
+
+### 开了之后的变化
+
+启动日志:
+
+```
+I (232) esp_psram: Found 8MB PSRAM device
+I (232) esp_psram: Speed: 80MHz
+I (665) esp_psram: SPI SRAM memory test OK
+I (677) esp_psram: Adding pool of 8192K of PSRAM memory to heap allocator
+I (1101) cam_hal: Allocating 100000 Byte frame buffer in PSRAM   <- 帧缓冲搬走了
+```
+
+1. **相机帧缓冲搬到 PSRAM**, 内部 RAM 一下腾出 100KB 给 WiFi / lwIP;
+2. 内部 RAM 宽裕之后, 上一节把板子搞崩的
+   `CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768` **这次能用了**;
+3. 往返延迟从 **18ms 降到 12ms**。
+
+### 实测对比 (直连板子, QVGA 质量 35, 间隔 30ms)
+
+| | 吞吐 | 帧率 |
+| --- | --- | --- |
+| 开 PSRAM 之前 | 39~96 KB/s | 10~16 帧/秒(抖) |
+| 开 PSRAM + 32KB 发送窗口 | **110~129 KB/s** | **16.1/16.3/16.1 帧/秒**(连续三段) |
+
+大帧更能看出差距: VGA 质量 20 (约 35KB/帧) 跑到 **272 KB/s** —— 而开 PSRAM 之前
+这条路的上限只有 88 KB/s。连续跑三段不再掉速, 结束后回环仍然正常
+(之前那样把窗口硬拉到 32KB 会"跑一会儿就死")。
+
+经完整链路 (网关 + base64 + WebSocket) 实测:
+
+| 设置 | 帧率 |
+| --- | --- |
+| QVGA + 视频质量 35 | **10.7 帧/秒** (板子实际出了 17.5 帧/秒, 中间被 PC 侧管道吃掉一部分) |
+| VGA + 视频质量 45 | **9.1 帧/秒** |
+
+也就是说瓶颈已经**从板子挪到了 PC 侧管道**(网关拼帧 → Banyan → wsgw → WebSocket)。
+下一步如果还要提速, 该动的是那一段, 而不是再多给 TCP 缓冲。
