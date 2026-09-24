@@ -217,7 +217,8 @@ Get-NetTCPConnection -State Listen | Where-Object LocalPort -in 43124,43125,9007
 | 朗读文字 | `audio_tts` (0x75) | 板子本地做中文语音合成（esp-tts），文字由网关按 UTF-8 拆包 |
 | 停止朗读 | `audio_tts_stop` (0x76) | 立刻停止朗读 |
 | 摄像头尺寸 | `camera_config` (0x78) | QVGA / VGA / SVGA / XGA / SXGA / UXGA；**流式播放建议 QVGA** |
-| 摄像头质量 | `camera_config` (0x78) | 0~63，越小越清晰（帧越大、越占带宽） |
+| 拍照质量 | `camera_config` (0x78) | 0~63，越小越清晰（帧越大、越占带宽）；拍照用 |
+| 视频质量 | `camera_config` (0x78) | 流式播放期间用的质量（默认 35）；点「打开摄像头」时临时切换，关闭时还原 |
 | **打开摄像头（画面显示在当前角色上）** | `camera_snapshot` (0x79, 帧数=0) | **流式播放**：板子连续出图，每帧原地刷到当前角色的「摄像头画面」造型上（不新建造型） |
 | 关闭摄像头 | `camera_stop` (0x7A) | 停止出图并给摄像头断电降温；点编辑器的停止按钮也会自动停 |
 | 拍一张照片（变成新造型） | `camera_snapshot` (0x79, 帧数=1) | 摄像头开着时 = 截当前画面（瞬时）；关着时单独拍一张（上电 + 预热，约 3 秒） |

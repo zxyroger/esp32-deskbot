@@ -183,10 +183,19 @@ async function run() {
     extension.cameraSize({ SIZE: 'VGA' });
 
     extension.cameraQuality({ QUALITY: 35 });
-    check('质量 35', lastCommand(), { command: 'camera_config', quality: 35 });
+    check('拍照质量 35', lastCommand(), { command: 'camera_config', quality: 35 });
     extension.cameraQuality({ QUALITY: 999 });
     check('质量超过 63 会被夹住', lastCommand(), { command: 'camera_config', quality: 63 });
     extension.cameraQuality({ QUALITY: 20 });
+
+    // 2b) 「视频质量」: 只在开流时生效, 不碰拍照质量
+    extension.streamQualityBlock({ QUALITY: 45 });
+    check('设视频质量时没开流 -> 先不发命令', lastCommand(), { command: 'camera_config', quality: 20 });
+    check('视频质量记住了', extension.streamQuality, 45);
+    extension.streamQualityBlock({ QUALITY: 999 });
+    check('视频质量也会被夹到 63', extension.streamQuality, 63);
+    extension.streamQualityBlock({ QUALITY: 30 });
+    check('视频质量 30', extension.streamQuality, 30);
 
     // 3) 没拍过/没开过时的状态
     check('初始状态', extension.cameraState(), '还没拍过（点「拍照」试试）');
@@ -222,11 +231,14 @@ async function run() {
     // ---- 从这里开始挂上假 vm, 验证流式播放 ----
     Scratch.vm = fakeVm;
 
-    // 7) 「打开摄像头」-> 连续拍 (帧数 0) + 按间隔节流
+    // 7) 「打开摄像头」-> 先把质量换成视频质量, 再连续拍 (帧数 0)
     lastSocket.sent.length = 0;
     extension.openVideo();
+    check('开流时先切到视频质量',
+        lastSocket.sent[0], { command: 'camera_config', quality: 30 });
     check('打开摄像头发的是 camera_snapshot(帧数 0)',
-        lastCommand(), { command: 'camera_snapshot', frames: 0, interval: 80 });
+        lastCommand(), { command: 'camera_snapshot', frames: 0, interval: 30 });
+    check('记下了开流前的拍照质量 (用来关流时还回去)', extension.qualityBeforeStream, 20);
 
     // 8) 连续 3 帧: 只建 1 个造型, 后两帧原地换贴图
     lastSocket.message(frameMessage(11));
@@ -256,11 +268,14 @@ async function run() {
     // 前面第 6 步已经拍过一张「照片 1」, 所以这次截的是「照片 2」
     check('截图造型按序号命名', addedCostumes[1] && addedCostumes[1].name, '照片 2');
 
-    // 10) 「关闭摄像头」
+    // 10) 「关闭摄像头」: 停流 + 把拍照质量还回去
     const assetBeforeClose = assetCount;
     extension.closeVideo();
     await delay(20);
-    check('关闭摄像头发的是 camera_stop', lastCommand(), { command: 'camera_stop' });
+    check('关闭摄像头发了 camera_stop',
+        lastSocket.sent.some((m) => m.command === 'camera_stop'), true);
+    check('关流时把拍照质量还回去',
+        lastCommand(), { command: 'camera_config', quality: 20 });
     check('关闭后不再接收视频帧', extension.videoOn, false);
     check('关闭时把造型资源刷成最后一帧', assetCount > assetBeforeClose, true);
     check('关闭后的状态文字', extension.cameraState(), '摄像头已关闭');

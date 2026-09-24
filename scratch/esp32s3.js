@@ -62,7 +62,14 @@
     var CAMERA_INFO_REFRESH_MS = 2000;     // 「摄像头状态」的查询/显示节流
     // 流式播放: 板子两帧之间的最小间隔 (实际帧率还受 WiFi / 解码速度限制)。
     // 想更流畅就把「摄像头尺寸」设成 QVGA —— 一帧只有 VGA 的 1/4。
-    var CAMERA_STREAM_INTERVAL_MS = 80;
+    //
+    // 别把这里当"限制", 它只防板子空转: 实测板子到 PC 的链路上限约 50~90 KB/s,
+    // QVGA 一帧 3~5KB 时链路能喂到 15~20 帧/秒 —— 之前写 80ms 等于自己先把
+    // 帧率锁死在 12.5 帧/秒, 白白丢了一截。
+    var CAMERA_STREAM_INTERVAL_MS = 30;
+    // 视频默认用比照片更"小"的质量 (数字大 = 帧小): 预览不需要那么细,
+    // 但帧小了帧率能翻倍。点「打开摄像头」时临时用这个值, 关闭时恢复拍照质量。
+    var CAMERA_STREAM_DEFAULT_QUALITY = 35;
     var VIDEO_COSTUME_NAME = '摄像头画面';
 
     // 引脚模式编号 (与固件/telemetrix 协议一致)
@@ -122,6 +129,8 @@
         this.videoFps = 0;
         this.videoFpsAt = 0;
         this.videoFpsCount = 0;
+        this.streamQuality = CAMERA_STREAM_DEFAULT_QUALITY;   // 「视频质量」积木设的
+        this.qualityBeforeStream = -1;      // 开流前的拍照质量, 关流时还回去
     }
 
     // 把状态拼成一句给人看的话。
@@ -489,9 +498,17 @@
                 {
                     opcode: 'cameraQuality',
                     blockType: Scratch.BlockType.COMMAND,
-                    text: '摄像头质量 [QUALITY]',
+                    text: '拍照质量 [QUALITY]',
                     arguments: {
                         QUALITY: { type: Scratch.ArgumentType.NUMBER, defaultValue: 20 }
+                    }
+                },
+                {
+                    opcode: 'streamQualityBlock',
+                    blockType: Scratch.BlockType.COMMAND,
+                    text: '视频质量 [QUALITY]',
+                    arguments: {
+                        QUALITY: { type: Scratch.ArgumentType.NUMBER, defaultValue: 35 }
                     }
                 },
                 {
@@ -1109,6 +1126,21 @@
         this.send({ command: 'camera_config', quality: quality }, true);
     };
 
+    // 「视频质量」: 只在流式播放期间生效; 帧越小帧率越高 (数字大 = 帧小)
+    Esp32S3.prototype.streamQualityBlock = function (args) {
+        var quality = parseInt(args.QUALITY, 10);
+        if (!isFinite(quality)) {
+            quality = CAMERA_STREAM_DEFAULT_QUALITY;
+        }
+        if (quality < 0) { quality = 0; }
+        if (quality > 63) { quality = 63; }
+        this.streamQuality = quality;
+        if (this.videoOn) {
+            // 正在放视频就立刻换过去, 不用重开
+            this.send({ command: 'camera_config', quality: quality }, true);
+        }
+    };
+
     /*
      * 「打开摄像头」: 让板子连续出图 (0x79 帧数=0), 每一帧原地刷到当前角色的
      * 「摄像头画面」造型上, 就是舞台上看到的实时画面。
@@ -1128,6 +1160,11 @@
         this.videoFps = 0;
         this.videoFpsCount = 0;
         this.videoFpsAt = Date.now();
+        /* 视频用更小的帧 (帧率能翻倍), 关的时候把拍照质量还回去 */
+        this.qualityBeforeStream = this.cameraInfoValue &&
+                                   this.cameraInfoValue.quality !== undefined
+            ? this.cameraInfoValue.quality : -1;
+        this.send({ command: 'camera_config', quality: this.streamQuality }, true);
         this.noteCamera('正在打开摄像头…（板子上电 + 预热，约 3 秒）');
         this.send({ command: 'camera_snapshot', frames: 0, interval: CAMERA_STREAM_INTERVAL_MS },
                   true);
@@ -1140,6 +1177,11 @@
         this.videoOn = false;
         this.videoBusy = false;
         this.send({ command: 'camera_stop' }, true);
+        if (this.qualityBeforeStream >= 0) {
+            // 流期间借用了质量设置, 还回去 (下次"拍一张照片"还是原来的清晰度)
+            this.send({ command: 'camera_config', quality: this.qualityBeforeStream }, true);
+            this.qualityBeforeStream = -1;
+        }
         this.noteCamera('摄像头已关闭');
         this.refreshVideoAsset();
     };
@@ -1280,8 +1322,13 @@
                 self.videoFps = Math.round(self.videoFpsCount * 1000 / elapsed);
                 self.videoFpsCount = 0;
                 self.videoFpsAt = now;
-                self.noteCamera('视频中：' + self.videoFps + ' 帧/秒' +
-                                (self.videoDropped ? '（丢掉 ' + self.videoDropped + ' 帧）' : ''));
+                var note = '视频中：' + self.videoFps + ' 帧/秒' +
+                           (self.videoDropped ? '（丢掉 ' + self.videoDropped + ' 帧）' : '');
+                if (self.videoFps < 6) {
+                    // 帧率就是"板子到电脑的带宽 ÷ 每帧字节数", 想快只能让帧变小
+                    note += '（想更流畅：尺寸换 QVGA，或把视频质量调大）';
+                }
+                self.noteCamera(note);
                 self.videoDropped = 0;
             }
         }).catch(function (err) {

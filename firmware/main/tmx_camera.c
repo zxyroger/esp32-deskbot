@@ -197,6 +197,9 @@ static void camera_power_on(void)
  */
 #define CAM_CHUNKS_PER_POLL  96
 
+/* 分片批量写的缓冲区大小。取 2*MSS(1440) 够摊平包头开销, 又不至于占太多内存 */
+#define CAM_BATCH_BYTES      2048
+
 static const framesize_t s_frame_sizes[] = {
     FRAMESIZE_QVGA,   /* 0: 320x240  */
     FRAMESIZE_VGA,    /* 1: 640x480  */
@@ -1661,32 +1664,55 @@ static void finish_frame(void)
 
 static void send_frame_chunks(void)
 {
-    uint8_t packet[6 + CAM_CHUNK_MAX];
+    /* 分片合并成批量写。
+     *
+     * 一片只有 246 字节, 原来是一片一次 s_send() —— 一帧 VGA 要 70 多次 send(),
+     * 每次都会变成一个 ~250 字节的 TCP 段 (socket 开了 TCP_NODELAY, 不会合并)。
+     * 段一多, 每字节要摊的 IP/TCP/WiFi 头开销就上去了, 实测卡在 88 KB/s 左右。
+     * 这里先把若干片拼进一个 2KB 的批 (里面仍然是若干个完整的"长度+包"结构,
+     * 协议不用改, PC 侧照旧逐包解析), 满了再一次性发出去 —— 一帧只剩 4~8 次
+     * send(), TCP 段也从 ~250 字节变成 ~1.4KB (正好一个 MSS)。
+     *
+     * 用 static 而不是栈上: 这个函数只在服务器任务里跑, 而那个任务栈只有 6KB,
+     * 放个 2KB 的数组上去太险。
+     */
+    static uint8_t batch[CAM_BATCH_BYTES];
+    size_t used = 0;
     int chunks = 0;
 
     while (s_fb != NULL && s_offset < s_fb->len && chunks < CAM_CHUNKS_PER_POLL) {
         size_t remaining = s_fb->len - s_offset;
         size_t n = remaining > CAM_CHUNK_MAX ? CAM_CHUNK_MAX : remaining;
 
+        if (used + 6 + n > sizeof(batch) && used > 0) {
+            if (!s_send(batch, used)) {
+                /* PC 掉线了, 别把帧缓冲借走不还 */
+                drop_current_frame();
+                s_frames_left = 0;
+                return;
+            }
+            used = 0;
+        }
+
         /* 数据: 序号(1) 偏移(3, 大端) JPEG 数据(n)。
          * 偏移给 3 字节: XGA 以上的 JPEG 会超过 64KB, 2 字节会回绕。 */
-        packet[0] = (uint8_t)(5 + n);
-        packet[1] = TMX_REPORT_CAMERA_FRAME;
-        packet[2] = s_frame_index;
-        packet[3] = (uint8_t)((s_offset >> 16) & 0xff);
-        packet[4] = (uint8_t)((s_offset >> 8) & 0xff);
-        packet[5] = (uint8_t)(s_offset & 0xff);
-        memcpy(&packet[6], s_fb->buf + s_offset, n);
-
-        if (!s_send(packet, n + 6)) {
-            /* PC 掉线了, 别把帧缓冲借走不还 */
-            drop_current_frame();
-            s_frames_left = 0;
-            return;
-        }
+        batch[used + 0] = (uint8_t)(5 + n);
+        batch[used + 1] = TMX_REPORT_CAMERA_FRAME;
+        batch[used + 2] = s_frame_index;
+        batch[used + 3] = (uint8_t)((s_offset >> 16) & 0xff);
+        batch[used + 4] = (uint8_t)((s_offset >> 8) & 0xff);
+        batch[used + 5] = (uint8_t)(s_offset & 0xff);
+        memcpy(&batch[used + 6], s_fb->buf + s_offset, n);
+        used += 6 + n;
 
         s_offset += n;
         chunks++;
+    }
+
+    if (used > 0 && !s_send(batch, used)) {
+        drop_current_frame();
+        s_frames_left = 0;
+        return;
     }
 
     if (s_fb != NULL && s_offset >= s_fb->len) {
