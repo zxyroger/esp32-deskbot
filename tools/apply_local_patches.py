@@ -95,7 +95,14 @@
     表现得非常迷惑: 网关进程还活着、到板子的 TCP 还是 ESTABLISHED、
     串口日志里板子照常"拍照 / 送 20620 字节", 但从此再也收不到板子任何上报
     (连 0x7B 摄像头状态都不回)。摄像头一帧要发 80 多片, 必然触发。
-    这里改成读满 num_bytes 再返回。
+   这里改成读满 num_bytes 再返回。
+
+补丁 12: ws 网关的转发循环对"单个客户端发送失败"免疫
+    ws_gateway.py 的 incoming_message_processing 里是 for ... await send(),
+    不兜异常: 只要有一个 ws 客户端写不进去 (断了 / 半死), 这一轮就抛出去把接收
+    循环打死 —— 现象是"板子在出图、网关日志写着已连接、Scratch 里画面却从此不动",
+    重启一次 wsgw 才恢复 (2026-09-25 晚真踩到过)。这里改成"发不出去就丢掉这个
+    客户端, 继续给其他人发"。
 
 用法:
     python tools\\apply_local_patches.py            # 放行 10, 11
@@ -833,6 +840,50 @@ TRANSPORT_DISPATCH_NEW = (
 )
 
 
+WSGW_SEND_OLD = """        ws_data = json.dumps(payload)
+
+        # find the websocket of interest by looking for the topic in
+        # active_sockets
+        for socket in self.active_sockets:
+            if topic in socket.keys():
+                pub_socket = socket[topic]
+                await pub_socket.send(ws_data)
+"""
+
+WSGW_SEND_NEW = """        ws_data = json.dumps(payload)
+
+        # 本地补丁 12: 一个坏掉的 ws 客户端不能把整条转发循环带走。
+        # 上游这段是 "for ... await send()" 而且不兜异常: 只要有一个客户端写不进去
+        # (连接断了 / 半死), 这一轮就会抛出去把接收循环打死, 而且一行日志都没有。
+        # 表现出来就是: 板子在出图、网关日志写着已连接、Scratch 里的画面却从此不动,
+        # 重启一次 wsgw 才恢复。这里改成"发不出去就丢掉这个客户端, 继续给其他人发"。
+        dead = []
+        for socket in self.active_sockets:
+            if topic in socket.keys():
+                pub_socket = socket[topic]
+                try:
+                    await pub_socket.send(ws_data)
+                except Exception as exc:
+                    print('ws send failed -> drop client: %r' % (exc,))
+                    dead.append(socket)
+        for socket in dead:
+            self.active_sockets = [s for s in self.active_sockets if s is not socket]
+"""
+
+
+def patch_wsgw_send_guard(path):
+    """ws 网关转发循环: 单个客户端发不出去不再拖垮整条循环; 返回 (是否改动, 备份路径)"""
+    text = path.read_text(encoding="utf-8")
+    if "本地补丁 12" in text:
+        return False, None
+    if WSGW_SEND_OLD not in text:
+        return None, None
+    bak = backup(path)
+    text = text.replace(WSGW_SEND_OLD, WSGW_SEND_NEW, 1)
+    path.write_text(text, encoding="utf-8")
+    return True, bak
+
+
 def patch_telemetrix_dispatch_guard(path):
     """让接收循环对未知上报/处理器异常免疫; 返回 (是否改动, 备份路径)"""
     text = path.read_text(encoding="utf-8")
@@ -1000,12 +1051,29 @@ def main():
             problems.append("%s 的代码与预期不一致, 请手动检查 IP 解析那一段" % module)
 
     print()
+    # ---- 补丁 12: ws 网关转发循环的容错 ----
+    ws_gateway = find_module_path("s3_extend.gateways.ws_gateway")
+    if not ws_gateway or not ws_gateway.exists():
+        problems.append("找不到 s3_extend.gateways.ws_gateway (先 pip install s3-extend)")
+    else:
+        changed, bak = patch_wsgw_send_guard(ws_gateway)
+        if changed:
+            print("  [12] ws 网关: 单个客户端发送失败不再拖垮转发循环")
+            print("        备份: %s" % bak)
+        elif changed is False:
+            print("  [12] ws 网关: 已是补丁状态, 无需改动")
+        else:
+            problems.append("ws_gateway.py 的发送循环与预期不一致, 请手动检查 "
+                            "incoming_message_processing")
+
+    print()
     if problems:
         for p in problems:
             print("注意: %s" % p)
         return 1
     print("重启网关让补丁生效:")
     print("    Get-Process esp32gw -ErrorAction SilentlyContinue | Stop-Process -Force")
+    print("    Get-Process wsgw   -ErrorAction SilentlyContinue | Stop-Process -Force")
     return 0
 
 
