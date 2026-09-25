@@ -138,16 +138,18 @@ const fakeVm = {
         },
         renderer: {
             updateBitmapSkin: function (skinId, canvas, resolution, center) {
-                skinUpdates.push({ skinId: skinId, resolution: resolution, center: center });
+                skinUpdates.push({ skinId: skinId, resolution: resolution, center: center,
+                                   reusable: canvas && canvas.reusable });
             }
         },
         on: () => {}
     },
-    editingTarget: { id: 'target1', sprite: { costumes: [] } },
+    editingTarget: { id: 'target1', currentCostume: 0, sprite: { costumes: [] } },
     addCostume: function (md5ext, costume, targetId) {
         costume.skinId = 100 + addedCostumes.length;
         this.editingTarget.sprite.costumes.push(costume);
         addedCostumes.push(costume);
+        this.editingTarget.currentCostume = this.editingTarget.sprite.costumes.length - 1;
         return Promise.resolve();
     }
 };
@@ -241,6 +243,7 @@ async function run() {
     check('记下了开流前的拍照质量 (用来关流时还回去)', extension.qualityBeforeStream, 20);
 
     // 8) 连续 3 帧: 只建 1 个造型, 后两帧原地换贴图
+    const canvasesBeforeVideo = canvasCount;
     lastSocket.message(frameMessage(11));
     await delay(10);
     lastSocket.message(frameMessage(12));
@@ -256,7 +259,26 @@ async function run() {
         skinUpdates[0].resolution, 2);
     check('旋转中心在画面正中',
         skinUpdates[0].center, [640 / 2 / 2, 480 / 2 / 2]);
+    check('画布标了 reusable=false (不让渲染器每帧再拷一份全画面)',
+        skinUpdates[0].reusable, false);
+    check('3 帧只用了 1 块画布 (复用, 不每帧新建 -> 不然显存一路涨)',
+        canvasCount - canvasesBeforeVideo, 1);
     check('画了 3 帧', extension.videoFrames, 3);
+
+    // 8b) 角色当前显示的是**别的**造型时, 扩展要把造型切回来
+    //     (踩过的坑: 复制出来的「摄像头画面2」成了当前造型 —— 扩展一直在画
+    //      「摄像头画面」, 舞台上却永远显示那张静止的复制品, 看着就是"画面不动")
+    // 临时塞一个"别的造型"并让它成为当前造型, 模拟"复制出来的摄像头画面2"那种情况
+    fakeVm.editingTarget.sprite.costumes.unshift({ name: '造型1', skinId: 999 });
+    fakeVm.editingTarget.currentCostume = 0;
+    lastSocket.message(frameMessage(14));
+    await delay(10);
+    check('扩展把造型切回「摄像头画面」',
+        fakeVm.editingTarget.currentCostume,
+        fakeVm.editingTarget.sprite.costumes.indexOf(addedCostumes[0]));
+    check('切造型时给了人话提示', /已切回/.test(extension.cameraState()), true);
+    fakeVm.editingTarget.sprite.costumes.shift();     // 收尾: 恢复原样
+    fakeVm.editingTarget.currentCostume = 0;
 
     // 9) 视频开着时「拍一张照片」= 截当前这一帧, 不再让板子拍
     lastSocket.sent.length = 0;
@@ -267,6 +289,100 @@ async function run() {
     check('截图变成第 2 个造型', addedCostumes.length, 2);
     // 前面第 6 步已经拍过一张「照片 1」, 所以这次截的是「照片 2」
     check('截图造型按序号命名', addedCostumes[1] && addedCostumes[1].name, '照片 2');
+
+    // 9b) 单帧画不出来只丢这一帧, 不许把整条流停掉
+    //     (以前任意一帧出异常就 videoOn = false: 画面定格, 板子却还在出图发热)
+    const renderOk = fakeVm.runtime.renderer.updateBitmapSkin;
+    fakeVm.runtime.renderer.updateBitmapSkin = function () { throw new Error('假渲染错误'); };
+    const skinsBeforeFail = skinUpdates.length;
+    lastSocket.message(frameMessage(21));
+    await delay(10);
+    check('单帧渲染失败后视频没有停', extension.videoOn, true);
+    check('单帧失败没有走换贴图', skinUpdates.length, skinsBeforeFail);
+    check('单帧失败的提示是"继续"', /继续/.test(extension.cameraState()), true);
+    fakeVm.runtime.renderer.updateBitmapSkin = renderOk;
+    lastSocket.message(frameMessage(22));
+    await delay(10);
+    check('下一帧照常画出来', skinUpdates.length, skinsBeforeFail + 1);
+    check('画成功一帧后失败计数清零', extension.videoErrors, 0);
+
+    // 9c) 连续 5 帧都画不出来才算真坏了
+    fakeVm.runtime.renderer.updateBitmapSkin = function () { throw new Error('假渲染错误'); };
+    for (let i = 0; i < 5; i++) {
+        lastSocket.message(frameMessage(30 + i));
+        await delay(10);
+    }
+    check('连续 5 帧失败后才停流', extension.videoOn, false);
+    check('停流时给出可操作提示',
+        /连续 5 帧.*再点一次「打开摄像头」/.test(extension.cameraState()), true);
+    fakeVm.runtime.renderer.updateBitmapSkin = renderOk;
+
+    // 9d) 卡住之后「打开摄像头」再点一次 = 重开
+    //     (以前 openVideo 开头 `if (this.videoOn) return;`, 点了完全没反应)
+    lastSocket.sent.length = 0;
+    extension.videoLastArrivalAt = 0;         // 模拟"卡住": 已经收不到帧了
+    extension.openVideo();
+    check('重开时重新发了 camera_snapshot',
+        lastCommand(), { command: 'camera_snapshot', frames: 0, interval: 30 });
+    check('重开后视频状态是开', extension.videoOn, true);
+    check('重开没有覆盖"开流前的拍照质量"', extension.qualityBeforeStream, 20);
+
+    // 9d-2) 画面正常时再点「打开摄像头」必须什么都不发
+    //       (有人把它放进 forever 循环: 实测 20 秒发出去 27 万条命令, 链路直接堵死)
+    extension.videoLastArrivalAt = Date.now();   // 帧刚刚还在来
+    lastSocket.sent.length = 0;
+    extension.openVideo();
+    check('画面正常时重复点「打开摄像头」不发命令', lastSocket.sent.length, 0);
+
+    lastSocket.message(frameMessage(40));
+    await delay(10);
+
+    // 9e) 看门狗: 帧一直在来, 但忙标记卡住了 -> 自动把最新一帧补画上去
+    const skinsBeforeWatchdog = skinUpdates.length;
+    extension.videoBusy = true;                       // 模拟"上一帧 promise 一直没回来"
+    extension.videoLastArrivalAt = Date.now();
+    extension.videoLastDrawAt = Date.now() - 5000;
+    extension.videoWatchdog();
+    await delay(10);
+    check('看门狗清掉了卡住的忙标记', extension.videoBusy, false);
+    check('看门狗补画了一帧', skinUpdates.length, skinsBeforeWatchdog + 1);
+    check('看门狗记了一次恢复', extension.videoRecoveries, 1);
+
+    // 9f) 本地服务断了 (比如守护进程重启 wsgw): 看门狗自己重连并重开摄像头
+    lastSocket.close();                       // 模拟 wsgw 被杀掉
+    await delay(5);
+    check('服务断开后视频先复位', extension.videoOn, false);
+    extension.videoWatchdog();                // 看门狗这一下应该发起重连
+    await delay(5);
+    const reconnectedSocket = lastSocket;
+    check('看门狗新建了 WebSocket', reconnectedSocket.readyState, 0);
+    reconnectedSocket.open();                 // 连上: 队列里的命令会被补发
+    await delay(5);
+    reconnectedSocket.message({ report: 'board_status', state: 'connected',
+                                address: '192.168.0.103', firmware: '3.2.0' });
+    await delay(5);
+    check('重连后自动重发了 camera_snapshot',
+        reconnectedSocket.sent.some((m) => m.command === 'camera_snapshot'), true);
+    check('重连后视频状态自己恢复', extension.videoOn, true);
+
+    // 9g) 调试上报: 连着的时候必须能发出来 (排障靠它)
+    lastSocket.sent.length = 0;
+    extension.videoDiag();
+    const diagMsg = lastSocket.sent[lastSocket.sent.length - 1];
+    check('调试上报发的是 video_diag', diagMsg && diagMsg.command, 'video_diag');
+    check('调试上报带上关键字段',
+        ['on', 'frames', 'current_costume', 'costumes', 'reports'].every((k) => k in diagMsg),
+        true);
+
+    // 9h) 流式播放中改「摄像头尺寸」: 固件会自己重建采集通路, 扩展只发命令
+    lastSocket.sent.length = 0;
+    extension.cameraSize({ SIZE: 'QVGA' });
+    await delay(10);
+    check('改尺寸先发 camera_config(size=0)',
+        lastSocket.sent[0], { command: 'camera_config', size: 0 });
+    check('改尺寸不会把流停掉 (固件现在支持在线换分辨率)',
+        lastSocket.sent.map((m) => m.command).includes('camera_stop'), false);
+    check('改尺寸后仍在流式播放', extension.videoOn, true);
 
     // 10) 「关闭摄像头」: 停流 + 把拍照质量还回去
     const assetBeforeClose = assetCount;
@@ -279,6 +395,22 @@ async function run() {
     check('关闭后不再接收视频帧', extension.videoOn, false);
     check('关闭时把造型资源刷成最后一帧', assetCount > assetBeforeClose, true);
     check('关闭后的状态文字', extension.cameraState(), '摄像头已关闭');
+
+    // 10b) 视频关着、也没在等照片时收到的帧: 既不能变成造型, 还要让板子停流
+    //      (真实故障: 这种帧被当成"照片", 10 分钟攒了 934 个造型, 画面卡死)
+    const photosBeforeStray = extension.photoCount;
+    const costumesBeforeStray = addedCostumes.length;
+    lastSocket.sent.length = 0;
+    lastSocket.message(frameMessage(60));
+    await delay(10);
+    check('没人要的帧不会变成造型', addedCostumes.length, costumesBeforeStray);
+    check('没人要的帧也不会算进拍照计数', extension.photoCount, photosBeforeStray);
+    check('没人要的帧会让板子停流',
+        lastSocket.sent.some((m) => m.command === 'camera_stop'), true);
+    lastSocket.sent.length = 0;
+    lastSocket.message(frameMessage(61));
+    await delay(10);
+    check('紧接着的垃圾帧不会再发 camera_stop (5 秒节流)', lastSocket.sent.length, 0);
 
     // 11) 本地服务断了也要把视频状态收回来 (板子发不出去会自己停流)
     extension.openVideo();

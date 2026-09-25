@@ -70,6 +70,11 @@
     // 视频默认用比照片更"小"的质量 (数字大 = 帧小): 预览不需要那么细,
     // 但帧小了帧率能翻倍。点「打开摄像头」时临时用这个值, 关闭时恢复拍照质量。
     var CAMERA_STREAM_DEFAULT_QUALITY = 35;
+    // 视频渲染的容错: 单帧画不出来只丢这一帧, **连续**这么多帧都画不出来才算真坏了。
+    // (以前任意一帧出错就 videoOn = false: 整条流永久停掉, 但板子那边还在出图发热)
+    var CAMERA_VIDEO_MAX_ERRORS = 5;
+    // 看门狗: 帧一直在来、却这么久没画成功 -> 判定卡在"上一帧还没画完"上, 自动补画
+    var CAMERA_VIDEO_STALL_MS = 3000;
     var VIDEO_COSTUME_NAME = '摄像头画面';
 
     // 引脚模式编号 (与固件/telemetrix 协议一致)
@@ -129,6 +134,14 @@
         this.videoFps = 0;
         this.videoFpsAt = 0;
         this.videoFpsCount = 0;
+        this.videoErrors = 0;               // 连续画失败的帧数 (画成功一帧就清零)
+        this.videoLastError = '';           // 最近一次画失败的原因 (给人看的)
+        this.videoLastArrivalAt = 0;        // 最近收到一帧的时刻 (看门狗用)
+        this.videoLastDrawAt = 0;           // 最近画成功一帧的时刻 (看门狗用)
+        this.videoRecoveries = 0;           // 看门狗自动重画了几次
+        this.reportsReceived = 0;           // 一共收到多少条板上/网关上报 (调试用)
+        this.lastReport = '';               // 最近一条上报的类型
+        this.lastReportAt = 0;              // 最近一条上报的时刻
         this.streamQuality = CAMERA_STREAM_DEFAULT_QUALITY;   // 「视频质量」积木设的
         this.qualityBeforeStream = -1;      // 开流前的拍照质量, 关流时还回去
     }
@@ -193,15 +206,50 @@
     /*
      * 板子给的是 JPEG。先解成 canvas: 拍照片那条路要转 PNG 存资源,
      * 流式播放那条路直接把 canvas 交给渲染器换贴图 (不新建造型)。
+     *
+     * reuseCanvas = true 时复用同一块画布 (流式播放专用): 每帧都 new 一个 XGA
+     * 画布, 等于每帧要一块 3MB 的画布后备存储 —— 实测 TurboWarp 的 GPU 进程内存
+     * 因此以 30~40MB/s 往上涨 (一直涨到 2.8GB 才回收), 这就是"软件用着用着整个
+     * 崩掉"的根源。渲染器收到 canvas 会在 updateBitmapSkin() 里**同步**做
+     * texImage2D (scratch-render 的 BitmapSkin._setTexture), 上传完再覆盖它是安全的。
+     * 拍照/截图那条路仍然每次新建 (要拿去编码 PNG, 不能和视频抢同一块画布)。
      */
-    function decodeJpegToCanvas(base64) {
+    var v_streamCanvas = null;
+
+    function decodeJpegToCanvas(base64, reuseCanvas) {
         return new Promise(function (resolve, reject) {
             var image = new Image();
             image.onload = function () {
-                var canvas = document.createElement('canvas');
-                canvas.width = image.width;
-                canvas.height = image.height;
+                var canvas;
+                if (reuseCanvas) {
+                    if (!v_streamCanvas) {
+                        v_streamCanvas = document.createElement('canvas');
+                    }
+                    canvas = v_streamCanvas;
+                    if (canvas.width !== image.width || canvas.height !== image.height) {
+                        canvas.width = image.width;
+                        canvas.height = image.height;
+                    }
+                } else {
+                    canvas = document.createElement('canvas');
+                    canvas.width = image.width;
+                    canvas.height = image.height;
+                }
                 canvas.getContext('2d').drawImage(image, 0, 0);
+                /*
+                 * 这一行是必须的: scratch-render 收到 canvas 时, 默认会先做一次
+                 *   canvas.getContext('2d').getImageData(0, 0, w, h)
+                 * 全画面拷贝 (见 BitmapSkin.setBitmap), 只有 canvas.reusable === false
+                 * 才直接把画布上传给纹理。
+                 *
+                 * 不标的话: 视频每一帧都白拷一份像素 —— 1024x768 是 3MB, 1280x1024
+                 * 是 5MB, 6 帧/秒就是每秒十几 MB 的垃圾; 渲染进程内存一路涨
+                 * (实测 30 秒 +96MB)。
+                 * TurboWarp 自己(Sprite2/位图适配)交 canvas 给渲染器时也是这么标的。
+                 * 它的意思是"上传完就随便你了": 渲染器是同步上传的, 所以流式播放
+                 * 复用同一块画布也没问题 (只有轮廓/碰撞检测会读到最新内容, 用不到)。
+                 */
+                canvas.reusable = false;
                 resolve(canvas);
             };
             image.onerror = function () { reject(new Error('画面解码失败')); };
@@ -245,6 +293,31 @@
             }
         }
         return null;
+    }
+
+    /*
+     * 让舞台上显示的确实是「摄像头画面」这块造型。
+     *
+     * 踩过的坑: 造型被复制过一份 (TurboWarp 自动命名成「摄像头画面2」) 并成了
+     * 当前造型, 之后扩展每帧都在刷原来的「摄像头画面」—— 扩展画得再勤, 舞台上
+     * 显示的也是那张静止的复制品, 看起来就是"画面不动"。
+     * 返回 true 表示这次真的把造型切回来了。
+     */
+    function showVideoCostume(vm, costume) {
+        var target = vm && vm.editingTarget;
+        if (!costume || !target || !target.sprite || !target.sprite.costumes) {
+            return false;
+        }
+        var index = target.sprite.costumes.indexOf(costume);
+        if (index < 0 || target.currentCostume === index) {
+            return false;
+        }
+        try {
+            target.currentCostume = index;      // scratch-vm 的 setter 会同步给渲染器
+            return true;
+        } catch (ignored) {
+            return false;
+        }
     }
 
     /*
@@ -314,7 +387,7 @@
             var resolution = 2;     // 与"照片造型"一致: 640x480 在舞台上占 320x240
             var center = [width / 2 / resolution, height / 2 / resolution];
 
-            decodeJpegToCanvas(msg['data']).then(function (canvas) {
+            decodeJpegToCanvas(msg['data'], true).then(function (canvas) {
                 var renderer = vm.runtime.renderer;
                 var existing = findCostume(vm.editingTarget, VIDEO_COSTUME_NAME);
                 if (existing) {
@@ -323,7 +396,9 @@
                     existing.rotationCenterX = width / 2;
                     existing.rotationCenterY = height / 2;
                     existing.bitmapResolution = resolution;
-                    resolve({ costume: existing, canvas: canvas });
+                    // 别画在一块"没被显示"的造型上 (见 showVideoCostume)
+                    resolve({ costume: existing, canvas: canvas,
+                              switched: showVideoCostume(vm, existing) });
                     return;
                 }
                 // 第一帧: 存成 PNG 资源, 挂一个固定名字的造型
@@ -344,7 +419,8 @@
                     };
                     return vm.addCostume(costume.md5, costume, vm.editingTarget.id)
                         .then(function () {
-                            resolve({ costume: costume, canvas: canvas });
+                            resolve({ costume: costume, canvas: canvas,
+                                      switched: showVideoCostume(vm, costume) });
                         });
                 }).catch(reject);
             }).catch(reject);
@@ -616,6 +692,10 @@
             // 本地服务断了: 板子那边会自己停流 (发不出去就收工), 这边把状态对上
             self.videoOn = false;
             self.videoBusy = false;
+            self.videoErrors = 0;
+            self.videoLastError = '';
+            self.videoLastArrivalAt = 0;
+            self.videoLastDrawAt = 0;
             // 正在等启动器拉起服务时, 别把"正在启动"盖成"未连接"
             if (self.launching) {
                 self.setStatus('starting');
@@ -634,6 +714,10 @@
                 return;
             }
             var report = msg['report'];
+            // 调试用: 记一下"到底收到过板子/网关的上报没有" (见 video_diag)
+            self.reportsReceived = (self.reportsReceived || 0) + 1;
+            self.lastReport = report || '';
+            self.lastReportAt = Date.now();
             if (report === 'board_status') {
                 // 守护进程上报的网关/板子连接状态
                 self.applyBoardStatus(msg);
@@ -672,8 +756,22 @@
                 // 一整帧 JPEG (网关把 0x10 帧头 + 0x0F 分片拼好并 base64 了)
                 if (self.videoOn) {
                     self.handleVideoFrame(msg);
-                } else {
+                } else if (self.photoDeferred) {
+                    // 只有"我们主动在等一张照片"时才当成照片
                     self.handlePhoto(msg);
+                } else if (Date.now() - (self.strayFrameAt || 0) > 5000) {
+                    /*
+                     * 既没在放视频、也没在等照片 —— 说明板子那头还挂着一条没停干净的
+                     * 连续流 (别人开的 / camera_stop 没送到 / 上次按停止时没发出去)。
+                     *
+                     * 这里必须丢掉这些帧: 以前会走 handlePhoto, 每帧编码成 PNG 再挂一个
+                     * 「照片 N」造型 —— 实测 10 分钟就攒出 934 个造型, 编辑器直接卡到
+                     * 画面不动, 一按停止反而恢复 (2026-09-25 晚真实故障)。
+                     * 顺手让板子把那边的流停掉, 5 秒最多发一次。
+                     */
+                    self.strayFrameAt = Date.now();
+                    self.noteCamera('收到没人要的视频帧（板子上还有流没停），已让它停流');
+                    self.send({ command: 'camera_stop' }, true);
                 }
             }
             // 有板子数据回来 = 整条链路 (Scratch→网关→板子→回传) 是通的
@@ -1114,6 +1212,13 @@
             index = 1;                    // 认不出来就退回 VGA
         }
         this.send({ command: 'camera_config', size: index }, true);
+        /*
+         * 2026-09-25 起固件已经能在线换分辨率了: tmx_camera_set_format() 发现尺寸
+         * 真的变了, 会自己把采集通路重建一遍 (deinit -> 重新 init + 预热),
+         * 新尺寸从下一帧就生效 —— 实测在线 SXGA/QVGA/VGA 都立刻跟着变。
+         * 所以这里只需要发命令; 之前那版"停流再重开"的绕法已经不需要了
+         * (旧固件才有这个问题: 只调 sensor->set_framesize() 出图尺寸不会变)。
+         */
     };
 
     Esp32S3.prototype.cameraQuality = function (args) {
@@ -1150,22 +1255,45 @@
      * 用「关闭摄像头」停, 或者点编辑器的停止按钮 (会自动停)。
      */
     Esp32S3.prototype.openVideo = function () {
-        if (this.videoOn) {
+        /*
+         * 已经开着的时候再点一次 = **重开**: 卡住时就是靠这个动作救回来的。
+         * 所以这里绝对不能 return (以前那版一 return, 卡住后点它完全没反应,
+         * 只能先去点「关闭摄像头」)。
+         *
+         * 但"重开"必须只在**真的卡住**时才做: 有人把这块积木放在 forever 循环里
+         * (实测每秒上千次), 如果每次都重发 camera_config + camera_snapshot, 命令
+         * 洪水会把整条链路堵死 —— 表现就是"一按运行画面就不动, 按停止反而恢复"。
+         * 判断标准: 最近 2 秒内还有帧进来, 就认为画面是活的, 直接返回不发命令。
+         */
+        if (this.videoOn && this.videoLastArrivalAt &&
+                (Date.now() - this.videoLastArrivalAt) < 2000) {
             return;
         }
+        var restarting = this.videoOn;
+        this.wantVideo = true;              // 关流前一直想放: 服务断了会自动重连重开
         this.videoOn = true;
         this.videoBusy = false;
+        this.videoErrors = 0;
+        this.videoLastError = '';
         this.videoFrames = 0;
         this.videoDropped = 0;
         this.videoFps = 0;
         this.videoFpsCount = 0;
         this.videoFpsAt = Date.now();
-        /* 视频用更小的帧 (帧率能翻倍), 关的时候把拍照质量还回去 */
-        this.qualityBeforeStream = this.cameraInfoValue &&
-                                   this.cameraInfoValue.quality !== undefined
-            ? this.cameraInfoValue.quality : -1;
+        this.videoLastArrivalAt = 0;
+        this.videoLastDrawAt = 0;
+        /* 视频用更小的帧 (帧率能翻倍), 关的时候把拍照质量还回去。
+         * 重开时别覆盖 qualityBeforeStream —— 那时它记的已经是「视频质量」了,
+         * 覆盖掉的话关流时就会把视频质量当成原来的拍照质量还回去。 */
+        if (!restarting) {
+            this.qualityBeforeStream = this.cameraInfoValue &&
+                                       this.cameraInfoValue.quality !== undefined
+                ? this.cameraInfoValue.quality : -1;
+        }
         this.send({ command: 'camera_config', quality: this.streamQuality }, true);
-        this.noteCamera('正在打开摄像头…（板子上电 + 预热，约 3 秒）');
+        this.noteCamera(restarting
+            ? '正在重开摄像头…（板子上电 + 预热，约 3 秒）'
+            : '正在打开摄像头…（板子上电 + 预热，约 3 秒）');
         this.send({ command: 'camera_snapshot', frames: 0, interval: CAMERA_STREAM_INTERVAL_MS },
                   true);
     };
@@ -1175,7 +1303,12 @@
             return;
         }
         this.videoOn = false;
+        this.wantVideo = false;             // 用户明确关了, 别再自动重开
         this.videoBusy = false;
+        this.videoErrors = 0;
+        this.videoLastError = '';
+        this.videoLastArrivalAt = 0;
+        this.videoLastDrawAt = 0;
         this.send({ command: 'camera_stop' }, true);
         if (this.qualityBeforeStream >= 0) {
             // 流期间借用了质量设置, 还回去 (下次"拍一张照片"还是原来的清晰度)
@@ -1303,6 +1436,7 @@
             return;
         }
         this.videoLastFrame = msg;
+        this.videoLastArrivalAt = Date.now();
         if (this.videoBusy) {
             this.videoDropped++;
             return;
@@ -1314,6 +1448,14 @@
             }
             self.videoCostume = result.costume;
             self.videoLastCanvas = result.canvas;
+            self.videoErrors = 0;              // 画成功一帧就把"连续失败"清零
+            self.videoLastDrawAt = Date.now();
+            if (result.switched) {
+                // 之前角色显示的是别的造型 (最常见的是复制出来的「摄像头画面2」),
+                // 那种情况下画面看着永远是静止的
+                self.noteCamera('已切回「' + VIDEO_COSTUME_NAME +
+                                '」造型（原来显示的是别的造型）');
+            }
             self.videoFrames++;
             self.videoFpsCount++;
             var now = Date.now();
@@ -1332,11 +1474,141 @@
                 self.videoDropped = 0;
             }
         }).catch(function (err) {
-            self.videoOn = false;
-            self.noteCamera('视频显示失败：' + (err && err.message ? err.message : err));
+            /*
+             * 单帧画不出来只丢这一帧 —— 网络抖一下、偶发一帧解不开, 都不该
+             * 把整条流停掉 (板子那边可不会知道, 会一直出图发热)。
+             * 连续 CAMERA_VIDEO_MAX_ERRORS 帧都失败, 才当成真的显示不了。
+             */
+            var message = err && err.message ? err.message : String(err);
+            self.videoErrors = (self.videoErrors || 0) + 1;
+            self.videoLastError = message;
+            if (self.videoErrors >= CAMERA_VIDEO_MAX_ERRORS) {
+                self.videoOn = false;
+                self.noteCamera('视频显示失败（连续 ' + self.videoErrors + ' 帧）：' + message +
+                                '，再点一次「打开摄像头」可以重开');
+            } else {
+                self.noteCamera('这一帧没画出来（' + message + '），继续（已连续 ' +
+                                self.videoErrors + ' 次）');
+            }
         }).then(function () {
             self.videoBusy = false;
         });
+    };
+
+    /*
+     * 流式播放看门狗。
+     *
+     * 画帧是"上一帧没画完就把新帧丢掉"(见 handleVideoFrame), 靠的是每帧的 promise
+     * 最后把 videoBusy 清掉。可 decode/render 里有个别路径 (比如某个回调一直不回来)
+     * 会让那个 promise 永远不 settle —— 于是 videoBusy 永远是 true, 之后每一帧都被
+     * 丢掉: 画面定格, 板子却还在出图。这个看门狗就是兜这个底的。
+     *
+     * 只在"帧还在来、但很久没画成功"时才动手; 帧本身不来(链路断了)不管 —— 那是
+     * 另一回事, 重画也画不出新画面。
+     */
+    Esp32S3.prototype.videoWatchdog = function () {
+        /*
+         * 先处理"本地服务断了": 只要这块积木没被关掉 (wantVideo), 就自己重连并重新
+         * 发一遍 camera_config / camera_snapshot —— 服务重启 (守护进程重启 wsgw /
+         * esp32gw) 之后画面能自己回来, 不用再去点积木。
+         * 3 秒一次, 免得重连不上时把待发队列撑爆。
+         */
+        if (this.wantVideo && !this.socketOpen()) {
+            if (Date.now() - (this.lastReconnectAt || 0) > 3000) {
+                this.lastReconnectAt = Date.now();
+                this.noteCamera('本地服务断了，正在重连并重开摄像头…');
+                this.openVideo();
+            }
+            return;
+        }
+        if (!this.videoOn || !this.videoLastFrame) {
+            return;
+        }
+        var now = Date.now();
+        if (!this.videoLastArrivalAt) {
+            return;                 // 一帧都还没到 (板子上电 + 预热那几秒)
+        }
+        if (now - this.videoLastArrivalAt > CAMERA_VIDEO_STALL_MS) {
+            return;                 // 帧也不来了: 链路/板子的问题, 不在这里装活
+        }
+        if (this.videoLastDrawAt && now - this.videoLastDrawAt < CAMERA_VIDEO_STALL_MS) {
+            return;                 // 画得好好的
+        }
+        // 卡住了: 不再等那一帧, 把手里最新的一帧补画上去
+        this.videoBusy = false;
+        this.videoRecoveries++;
+        this.videoLastDrawAt = now;
+        this.noteCamera('画面卡住了，正在自动重画（第 ' + this.videoRecoveries + ' 次）');
+        this.handleVideoFrame(this.videoLastFrame);
+    };
+
+    /*
+     * 调试上报 (排障用, 用完请把 VIDEO_DIAG_ENABLED 改回 false)。
+     *
+     * 每 5 秒往 Banyan 总线 (topic `to_esp32_gateway`) 发一条
+     * {"command": "video_diag", ...} —— 网关对不认识的命令是直接忽略的, 不会去
+     * 打扰板子; 而 PC 侧用它就能看到扩展内部状态, 不用盯着 Scratch 界面:
+     *
+     *     python tools\sniff_camera_stream.py --diag --seconds 20
+     *
+     * 里面的 current_costume / costume 两项专门用来回答"扩展画出来的造型, 是不是
+     * 舞台上正在显示的那个"。
+     */
+    var VIDEO_DIAG_ENABLED = false;     // 排障用, 平时关掉 (每 5 秒一条上报)
+    var VIDEO_DIAG_INTERVAL_MS = 5000;
+
+    Esp32S3.prototype.videoDiag = function () {
+        if (!this.connected) {
+            return;                 // 没连上就别发, 免得把待发队列撑大
+        }
+        var vm = Scratch.vm;
+        var target = vm && vm.editingTarget;
+        var sprite = target && target.sprite;
+        var names = [];
+        var videoCostume = null;
+        var currentName = null;
+        if (sprite && sprite.costumes) {
+            for (var i = 0; i < sprite.costumes.length; i++) {
+                var costume = sprite.costumes[i];
+                if (!costume) {
+                    continue;
+                }
+                names.push(costume.name);
+                if (costume.name === VIDEO_COSTUME_NAME) {
+                    videoCostume = costume;
+                }
+                if (target.currentCostume === i) {
+                    currentName = costume.name;
+                }
+            }
+        }
+        var now = Date.now();
+        this.send({
+            command: 'video_diag',
+            on: this.videoOn,
+            busy: this.videoBusy,
+            frames: this.videoFrames,
+            dropped: this.videoDropped,
+            errors: this.videoErrors,
+            last_error: this.videoLastError,
+            recoveries: this.videoRecoveries,
+            fps: this.videoFps,
+            since_arrival_ms: this.videoLastArrivalAt ? now - this.videoLastArrivalAt : -1,
+            since_draw_ms: this.videoLastDrawAt ? now - this.videoLastDrawAt : -1,
+            reports: this.reportsReceived || 0,
+            last_report: this.lastReport || '',
+            last_report_ms: this.lastReportAt ? now - this.lastReportAt : -1,
+            photo_count: this.photoCount,
+            costume: videoCostume ? videoCostume.name : null,
+            costume_skin: videoCostume ? videoCostume.skinId : null,
+            current_costume: currentName,
+            costumes: names,
+            sprite: sprite ? sprite.name : null,
+            visible: sprite ? sprite.visible : null,
+            size: sprite ? sprite.size : null,
+            connected: this.connected,
+            status: this.statusState
+        }, false);
     };
 
     Esp32S3.prototype.digitalRead = function (args) {
@@ -1369,6 +1641,46 @@
     };
 
     var extensionInstance = new Esp32S3();
+
+    /*
+     * 每秒让看门狗看一眼流式播放有没有卡住。
+     * node 里跑测试时 unref() 一下, 免得这个定时器把测试进程拖住不退出。
+     */
+    function startVideoWatchdog(ext) {
+        var timer = setInterval(function () {
+            try {
+                ext.videoWatchdog();
+            } catch (ignored) {
+                /* 看门狗自己出问题不能把扩展带崩 */
+            }
+        }, 1000);
+        if (timer && typeof timer.unref === 'function') {
+            timer.unref();
+        }
+        return timer;
+    }
+
+    startVideoWatchdog(extensionInstance);
+
+    // 调试上报定时器 (VIDEO_DIAG_ENABLED = false 时不会启动)
+    function startVideoDiag(ext) {
+        if (!VIDEO_DIAG_ENABLED) {
+            return null;
+        }
+        var timer = setInterval(function () {
+            try {
+                ext.videoDiag();
+            } catch (ignored) {
+                /* 调试上报自己不能把扩展带崩 */
+            }
+        }, VIDEO_DIAG_INTERVAL_MS);
+        if (timer && typeof timer.unref === 'function') {
+            timer.unref();
+        }
+        return timer;
+    }
+
+    startVideoDiag(extensionInstance);
 
     /*
      * 点编辑器的停止按钮时, 顺手把板子的流也停掉 —— 指令停了画面还在放、
