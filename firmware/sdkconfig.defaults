@@ -25,6 +25,13 @@ CONFIG_SPIRAM_USE_MALLOC=y
 # 有 PSRAM 撑腰之后放大到 32KB, 相机流式播放吞吐翻倍。
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
 
+# TCP keepalive: 这块板子同一时刻只服务一个客户端, 客户端"半死"(进程被杀 / 掉电,
+# 没发 FIN)时, 板子会一直等在旧 socket 上, 新连接进不来 —— 表现是 ping 通、
+# TCP 连不上, 只能复位板子。代码里给 client socket 设的
+# TCP_KEEPIDLE/INTVL/CNT(=10/5/3, 约 25 秒) 只有在 lwIP 编译了 keepalive 时才
+# 生效, 而 ESP-IDF 默认是**关**的 —— 之前那几次"板子连不上"就是这个。
+CONFIG_LWIP_TCP_KEEPALIVE=y
+
 # 板载 I2C 总线: SDA=GPIO1 / SCL=GPIO2 (总线上挂着 ES8311 音频 codec, 地址 0x30)
 CONFIG_TMX_I2C_SDA_PIN=1
 CONFIG_TMX_I2C_SCL_PIN=2

@@ -1224,11 +1224,31 @@ esp_err_t tmx_camera_set_format(int frame_size, int quality, int pixformat)
             ESP_LOGW(TAG, "分辨率索引 %d 非法 (0~%d)", frame_size, CAM_SIZE_COUNT - 1);
             return ESP_ERR_INVALID_ARG;
         }
-        if (sensor->set_framesize(sensor, s_frame_sizes[frame_size]) != 0) {
-            ESP_LOGW(TAG, "设置分辨率失败 (索引 %d)", frame_size);
-            return ESP_FAIL;
+        if (frame_size != s_size_index) {
+            /*
+             * 光调一次 sensor->set_framesize() 是**不够**的: DVP/JPEG 这条采集通路
+             * (DMA + 帧缓冲大小 + 驱动内部按分辨率算的各种参数) 是 esp_camera_init()
+             * 那一刻配好的, 只改传感器寄存器, 出图尺寸不会变 —— 实测在线改
+             * QVGA/VGA/SXGA, camera_info 立刻反映新尺寸, 但出来的帧一直是老尺寸。
+             *
+             * 所以这里直接把传感器断掉重来一遍 (deinit + 重新 init, 含预热),
+             * 新尺寸从下一帧起生效。代价是流会停 2~3 秒, 这是必须的。
+             */
+            ESP_LOGI(TAG, "分辨率 %s -> %s: 重新初始化采集通路",
+                     s_frame_names[s_size_index], s_frame_names[frame_size]);
+            s_size_index = frame_size;
+            drop_current_frame();       /* 别把马上就要 deinit 的帧缓冲借走不还 */
+            camera_sensor_off();        /* deinit + 断电 */
+            esp_err_t err = tmx_camera_init();
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "换分辨率后重新初始化失败: %s", esp_err_to_name(err));
+                return err;
+            }
+            sensor = sensor_or_null();  /* init 之后传感器句柄要重新取 */
+            if (sensor == NULL) {
+                return ESP_ERR_INVALID_STATE;
+            }
         }
-        s_size_index = frame_size;
     }
 
     if (pixformat > 0) {
