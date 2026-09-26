@@ -384,6 +384,23 @@ python D:\esp\onegpio\tools\pc_camera_check.py 192.168.0.103 --scan       # 扫 
 
 接线、协议字段、帧率说明和排障见 [docs/camera-ov2640.md](docs/camera-ov2640.md)。
 
+视频卡顿/画面定格怎么查（按这个顺序，一次能定位到是哪一段）：
+
+```powershell
+python tools\sniff_camera_stream.py --seconds 15 --info --verify   # 板子出的帧、节奏、完整性
+python tools\sniff_camera_stream.py --via ws --seconds 15          # Scratch 收到的那条 WebSocket
+```
+
+两条都正常就说明问题在 Scratch/浏览器侧（`--diag` 可以读扩展内部状态，需要先临时把
+扩展里的 `VIDEO_DIAG_ENABLED` 打开）。提醒两个容易误判的坑：
+
+* **"板子推流时 ping 很大"是正常的**：ICMP 回包排在 TCP 视频数据后面，实测中位
+  157ms，而同期视频帧间隔中位只有 120ms、零长停顿 —— 判断视频好坏要看帧间隔。
+* **视频每几秒冻结一下，先怀疑电脑自己的无线网卡**（周期性扫描/重关联、频段引导
+  拉锯）。判别方法：`ping 路由器` 和 `ping 板子` 如果在同一时刻一起卡，那就是电脑的
+  网卡，不是板子。完整案例（每 6 秒重关联一次 → 改网卡高级属性解决）记在
+  [docs/camera-debug-notes.md](docs/camera-debug-notes.md)。
+
 ## 板载中文语音合成（朗读文字）
 
 「朗读文字 [ ]」积木把文字发到板子，板子用 Espressif 的 **esp-tts**（esp-sr 组件里的

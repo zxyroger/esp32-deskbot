@@ -972,3 +972,57 @@ QVGA/VGA/SXGA 分别约 160x120 / 320x240 / 640x512 个舞台单位。
 设的 TCP_KEEPIDLE/INTVL/CNT 其实被 lwIP 忽略, 客户端"半死"(进程被杀/掉电, 没发
 FIN)时板子会永远等在旧 socket 上, 新连接进不来 (表现为 ping 通、TCP 连不上,
 只能复位板子)。打开之后大约 25 秒就能把这半死连接回收掉。
+
+## 剩下的"周期性卡顿": 是**电脑的无线网卡每 6 秒重关联一次** (2026-09-26)
+
+现象: 板子、固件、扩展都正常了, 视频仍然每 **~6 秒**冻结 **1.2~1.5 秒** (XGA
+10.3 帧/秒时最明显)。
+
+### 定位过程 (一路排除到电脑的网卡)
+
+1. **板子侧没问题**: RSSI **-45dBm** (信号很强)、信道 **6** (扫到的 9 个邻居全在信道
+   11)、`Set ps type: 0` (省电关闭)、91/91 帧合法且没有拼帧丢失。
+2. **两个方向同时卡** → 不是板子: `ping 路由器` (5GHz 直连) 和 `ping 板子` 在**同一
+   时刻**一起卡 (路由器那条从 0% 丢包变成 4.5%、尖峰 550ms)。板子之外的公共环节
+   只有电脑自己。
+3. **WLAN 事件日志** (`Microsoft-Windows-WLAN-AutoConfig/Operational`) 给出铁证:
+   每 **6 秒**一次 `无线安全功能 已停止 → 已启动 → 成功` (11004/11010/11005), 而
+   ping 的丢包/尖峰**全部紧跟在这些事件之后** (例: :10 事件后 :12 出现 1074ms、
+   :14~:16 连续丢包)。
+4. **网卡高级属性** (`Get-NetAdapterAdvancedProperty -Name WLAN`):
+
+   ```
+   Multi-Channel Concurrent         = Enabled + Hotspot
+   Concurrent Operation Preference  = 2.4GHz Single Channel Operation
+   ```
+
+   驱动被配置成"STA+热点并发、偏好 2.4GHz 单信道", 而路由器 "zhr" 是 2.4G/5G
+   同名 (会做频段引导) —— 两边互相拉锯, 结果就是每 6 秒重新关联/重协商密钥一次。
+
+### 修法 (管理员 PowerShell; 改完网卡会自动重启一下)
+
+```powershell
+Set-NetAdapterAdvancedProperty -Name WLAN -DisplayName 'Multi-Channel Concurrent' -DisplayValue 'Disabled'
+Set-NetAdapterAdvancedProperty -Name WLAN -DisplayName 'Concurrent Operation Preference' -DisplayValue 'No Preference'
+Restart-NetAdapter -Name WLAN
+```
+
+(更省事的替代方案: 给电脑插网线。当时 `以太网` 是 Disconnected, 整条无线链路都能绕开。)
+
+### 改前 / 改后
+
+| | 改之前 | 改之后 |
+| --- | --- | --- |
+| WLAN 安全重关联 | **每 6 秒一次** | **3 分钟内 0 次** |
+| 视频帧间隔 | 中位 120ms, p90 203ms, 最长 **1547ms**, 长停顿 4 次 / 13 秒 | 中位 120ms, p90 136ms, 最长 **232ms**, **长停顿 0 次** |
+| 帧完整性 | 全部合法 | 171/171 全部合法 |
+| `ping 路由器` | 0% → 4.5% 丢包, 尖峰 550ms | 0% 丢包, RTT 1.6ms |
+
+### 两个记下来的坑
+
+* **板子推流时不能拿 ping 判断视频好坏**: 视频在跑时板子的 ICMP 回包排在 TCP
+  视频数据后面, 实测 `ping 板子` 中位 157ms、偶尔 900ms —— 但同期视频帧间隔
+  中位 120ms、零长停顿。判断视频质量要看**帧到达间隔/长停顿**(用
+  `tools/sniff_camera_stream.py`), 别被 ping 带偏。
+* 这类"两个方向一起卡"的现象, 先怀疑**电脑自己的无线网卡** (周期性扫描 / 重关联 /
+  频段引导拉锯), 用 `ping 路由器` 和 WLAN 事件日志两条线一对就能确认。
