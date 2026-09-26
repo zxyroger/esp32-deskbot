@@ -26,3 +26,6 @@ tools/stripe/
 
 # 随手拍的样张 / 对比图
 tools/photos/
+
+# 电池放电实测日志 (跑几分钟就有几十行, 不进版本库)
+tools/battery_log*.csv

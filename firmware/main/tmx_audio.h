@@ -34,6 +34,13 @@ void tmx_audio_stop(void);
 
 bool tmx_audio_tts_active(void);
 
+/* 音频这块现在有没有活干 (放音 / 麦克风开着 / 正在朗读); 有活干就不能省电 */
+bool tmx_audio_busy(void);
+
+/* 空闲省电: 停 I2S 时钟 + 静音 + 关 PA 功放。
+ * 之后再放音 / 开麦克风时会自动恢复, 上层只管调; 没启用音频时是空实现。 */
+void tmx_audio_power_save(bool on);
+
 /* 把合成的 16kHz/16bit 单声道 PCM 回传一份给 PC (调试/存 wav 用) */
 void tmx_audio_set_mirror(bool enable);
 bool tmx_audio_mirror_on(void);

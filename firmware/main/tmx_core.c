@@ -969,10 +969,13 @@ static void scan_audio_input(void)
  * 每 2 秒看一次, 但只有"电量变了 / 电压变化 20mV 以上 / 供电状态变了"才发,
  * 另外每 30 秒补一条心跳 —— 免得每 2 秒刷一条小包。
  *
- * 包格式: 标志(1) 电池mV(2, 大端) 电量%(1) VBUS mV(2, 大端) 电池电流mA(2, 大端有符号)
+ * 包格式: 标志(1) 电池mV(2, 大端) 电量%(1) VBUS mV(2, 大端)
+ *         电池电流mA(2, 大端有符号, 估算) 放电速率(2, 大端有符号, 0.1%/h)
  *         标志 bit0 = 电池在位, bit1 = 外部(USB)供电, bit2 = 充电中
- *         电量 255 = 读不到
- *         电流: 正 = 充电, 负 = 放电
+ *         电量 255 = 读不到; VBUS = 0 表示没插 USB
+ *         电流/速率: 正 = 充电(电量在涨), 负 = 放电
+ *         电流不是实测的 (AXP2101 没有电流 ADC), 是电量计的变化率 × 容量换算的,
+ *         详见 tmx_power.c 文件头。新增字段加在末尾, 老网关会忽略多余字节。
  */
 static void scan_power(void)
 {
@@ -990,8 +993,8 @@ static void scan_power(void)
     if (info.charging) {
         flags |= 0x04;
     }
-    uint8_t packet[10];
-    packet[0] = 9;                       /* 之后的字节数 = 报告码(1) + 数据(8) */
+    uint8_t packet[12];
+    packet[0] = 11;                      /* 之后的字节数 = 报告码(1) + 数据(10) */
     packet[1] = TMX_REPORT_POWER;
     packet[2] = flags;
     packet[3] = (uint8_t)((info.battery_mv >> 8) & 0xff);
@@ -1001,16 +1004,20 @@ static void scan_power(void)
     packet[7] = (uint8_t)(info.vbus_mv & 0xff);
     packet[8] = (uint8_t)((info.current_ma >> 8) & 0xff);
     packet[9] = (uint8_t)(info.current_ma & 0xff);
+    packet[10] = (uint8_t)((info.rate_pph_x10 >> 8) & 0xff);
+    packet[11] = (uint8_t)(info.rate_pph_x10 & 0xff);
     tmx_core_send(packet, sizeof(packet));
 }
 
 /*
  * 自动省电 (电池供电时省电流的大头)。
  *
- * 这块板子电池上的常驻开销主要三块: WiFi(省电关掉时 ~80mA)、LCD 背光(80% 几十 mA)、
- * CPU 160MHz。这里做的是: **电池供电 + 空闲(一段时间没命令、相机也没在出图)** 时
+ * 这块板子电池上的常驻开销主要几块: WiFi(省电关掉时 ~80mA)、LCD 背光(80% 几十 mA)、
+ * CPU 160MHz、音频 codec 那一路一直开着的 I2S 时钟。这里做的是:
+ * **电池供电 + 空闲(一段时间没命令、相机没出图、也没在放音/开麦克风)** 时
  *   1. WiFi 进 modem sleep (跟着 AP 的 DTIM 睡觉, 下行晚 ~100ms 醒来);
- *   2. 关掉 LCD 背光。
+ *   2. 关掉 LCD 背光;
+ *   3. 停掉音频的 I2S 时钟 + 静音 + 关 PA 功放。
  * 一旦有命令进来 / 开始推流 / 插上 USB, 立刻恢复原状 (延迟优先)。
  * CPU 那一路由 DFS 负责 (见 tmx_core_init 里的 esp_pm_configure)。
  */
@@ -1023,7 +1030,8 @@ static void scan_power_save(void)
     bool on_battery = !tmx_power_external_power();
     bool idle = (now - s_last_command_ms) >= CONFIG_TMX_POWER_SAVE_IDLE_MS;
     bool streaming = (tmx_camera_state() == TMX_CAMERA_STATE_STREAM);
-    bool want = on_battery && idle && !streaming;
+    bool audio_busy = tmx_audio_busy();
+    bool want = on_battery && idle && !streaming && !audio_busy;
 
     if (want == s_saving) {
         return;
@@ -1031,9 +1039,10 @@ static void scan_power_save(void)
     s_saving = want;
     wifi_link_set_power_save(want);
     display_ili9341_power_save(want);
-    ESP_LOGI(TAG, "自动省电 %s (电池供电=%d 空闲=%d 推流中=%d)",
-             want ? "开: WiFi modem sleep + 关背光" : "关: 恢复低延迟 + 背光",
-             (int)on_battery, (int)idle, (int)streaming);
+    tmx_audio_power_save(want);
+    ESP_LOGI(TAG, "自动省电 %s (电池供电=%d 空闲=%d 推流中=%d 音频忙=%d)",
+             want ? "开: WiFi modem sleep + 关背光 + 停音频" : "关: 恢复低延迟 + 背光 + 音频",
+             (int)on_battery, (int)idle, (int)streaming, (int)audio_busy);
 #endif
 }
 

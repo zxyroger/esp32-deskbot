@@ -219,16 +219,23 @@ async function run() {
     check('还没收到电池上报时电量为空', extension.batteryPercent(), '');
     lastSocket.message({ report: 'battery', present: true, external_power: true, charging: true,
                          millivolts: 4069, percent: 72, vbus_millivolts: 4898,
-                         current_ma: 180 });
+                         current_ma: 180, rate_pph_x10: 180 });
     check('电池电量 72', extension.batteryPercent(), 72);
     check('电池电压 4.07V', extension.batteryVoltage(), '4.07');
     check('电池状态: 充电中', extension.batteryState(), '充电中');
     check('电池电流 (充电为正)', extension.batteryCurrent(), 180);
+    check('放电速度 (电量在涨就是负的)', extension.batteryRate(), '-18.0');
     lastSocket.message({ report: 'battery', present: true, external_power: false, charging: false,
-                         millivolts: 3721, percent: 41, vbus_millivolts: 0, current_ma: -260 });
+                         millivolts: 3721, percent: 41, vbus_millivolts: 0, current_ma: -260,
+                         rate_pph_x10: -130 });
     check('电池状态: 电池供电', extension.batteryState(), '电池供电');
     check('电池电压跟着变', extension.batteryVoltage(), '3.72');
     check('电池电流 (放电为负)', extension.batteryCurrent(), -260);
+    check('放电速度 13%/小时', extension.batteryRate(), '13.0');
+    // 老网关 (补丁 14 之前) 不带 rate 字段 -> 显示空, 而不是 0
+    lastSocket.message({ report: 'battery', present: true, external_power: false, charging: false,
+                         millivolts: 3721, percent: 41, vbus_millivolts: 0, current_ma: -260 });
+    check('老网关没有速率字段时显示空', extension.batteryRate(), '');
     lastSocket.message({ report: 'battery', present: false, external_power: true, charging: false,
                          millivolts: 0, percent: 255, vbus_millivolts: 4890 });
     check('没接电池时电量为空', extension.batteryPercent(), '');

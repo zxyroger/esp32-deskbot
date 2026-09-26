@@ -150,7 +150,8 @@
         this.batteryCharging = false;
         this.batteryMillivolts = 0;
         this.batteryPercentValue = -1;      // -1 = 还不知道
-        this.batteryCurrentMa = 0;          // 正 = 充电, 负 = 放电
+        this.batteryCurrentMa = 0;          // 正 = 充电, 负 = 放电 (估算)
+        this.batteryRatePph = null;         // 放电速率 %/h, null = 还没攒够数据
         this.streamQuality = CAMERA_STREAM_DEFAULT_QUALITY;   // 「视频质量」积木设的
         this.qualityBeforeStream = -1;      // 开流前的拍照质量, 关流时还回去
     }
@@ -647,7 +648,13 @@
                 {
                     opcode: 'batteryCurrent',
                     blockType: Scratch.BlockType.REPORTER,
-                    text: '电池电流（mA）',
+                    text: '电池电流（mA，估算）',
+                    arguments: {}
+                },
+                {
+                    opcode: 'batteryRate',
+                    blockType: Scratch.BlockType.REPORTER,
+                    text: '电池放电速度（%/小时）',
                     arguments: {}
                 },
                 '---',
@@ -814,6 +821,9 @@
                 self.batteryCharging = !!msg['charging'];
                 self.batteryMillivolts = parseInt(msg['millivolts'], 10) || 0;
                 self.batteryCurrentMa = parseInt(msg['current_ma'], 10) || 0;
+                // 放电速率 (0.1%/h, 负 = 放电)。老网关不带这个字段, 就当"还不知道"
+                var rate = parseInt(msg['rate_pph_x10'], 10);
+                self.batteryRatePph = isFinite(rate) ? rate / 10 : null;
                 var percent = parseInt(msg['percent'], 10);
                 // 固件用 255 表示"读不到", 网关会转成 -1; 这里只认 0~100, 其余当未知
                 self.batteryPercentValue = (isFinite(percent) && percent >= 0 && percent <= 100)
@@ -1470,9 +1480,22 @@
         return this.batteryExternal ? '外部供电' : '电池供电';
     };
 
-    /* 电池电流: 正 = 充电, 负 = 放电 (绝对值就是放电/充电电流) */
+    /*
+     * 电池电流: 正 = 充电, 负 = 放电。
+     * AXP2101 没有电池电流 ADC —— 这是用内置电量计的百分比变化率 × 电池容量
+     * (menuconfig TMX_BATTERY_CAPACITY_MAH) 换算出来的**平均**电流, 所以要跑
+     * 几分钟才有意义, 数值也只是个估算。
+     */
     Esp32S3.prototype.batteryCurrent = function () {
         return this.batteryCurrentMa;
+    };
+
+    /* 电池放电速度 (%/小时): 正 = 在放电, 负 = 电量在涨 (充电中), 空 = 数据还不够 */
+    Esp32S3.prototype.batteryRate = function () {
+        if (this.batteryRatePph === null || !this.batteryPresent) {
+            return '';
+        }
+        return (-this.batteryRatePph).toFixed(1);
     };
 
     // 收到一整帧: 存下 data URL, 变成当前角色的新造型, 再放行「拍照」积木

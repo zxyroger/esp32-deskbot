@@ -47,6 +47,8 @@ void tmx_audio_set_mic_reporting(bool enable) { (void)enable; }
 bool tmx_audio_mic_reporting(void) { return false; }
 int tmx_audio_mic_level(void) { return 0; }
 bool tmx_audio_tts_active(void) { return false; }
+bool tmx_audio_busy(void) { return false; }
+void tmx_audio_power_save(bool on) { (void)on; }
 void tmx_audio_set_mirror(bool enable) { (void)enable; }
 bool tmx_audio_mirror_on(void) { return false; }
 int tmx_audio_mirror_read(uint8_t *dst, int max_len) { (void)dst; (void)max_len; return 0; }
@@ -56,6 +58,7 @@ void tmx_audio_mirror_clear_end(void) { }
 #else
 
 #include "driver/i2s_std.h"
+#include "driver/gpio.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "es8311_codec.h"
@@ -89,6 +92,7 @@ static int16_t                s_tts_last;           /* 上一块的最后一个�
 
 static volatile bool     s_ready;
 static volatile int      s_src;                     /* AUDIO_SRC_xxx */
+static volatile bool     s_i2s_on;                  /* I2S 时钟是否开着 (省电时会停) */
 static volatile bool     s_tone_active;
 static volatile int      s_tone_freq;
 static volatile int      s_tone_volume;
@@ -117,6 +121,45 @@ static void audio_i2s_close(void)
         i2s_del_channel(s_rx);
         s_rx = NULL;
     }
+    s_i2s_on = false;
+}
+
+/*
+ * 省电: 把 I2S 的 MCLK/BCLK 停掉。
+ *
+ * ES8311 是 I2S 从机, 主机不送时钟它就进 idle; 麦克风那一路同理。板上音频这块
+ * 一直是"codec 开着 + 两个方向的 I2S 一直在跑", 空闲时停掉能省一笔常驻开销。
+ * 放音/开麦克风之前必须先用 tmx_audio_power_save(false) 把时钟放回来。
+ */
+static void audio_i2s_stop(void)
+{
+    if (s_tx) {
+        i2s_channel_disable(s_tx);
+    }
+    if (s_rx) {
+        i2s_channel_disable(s_rx);
+    }
+    s_i2s_on = false;
+}
+
+static void audio_i2s_resume(void)
+{
+    if (s_tx) {
+        i2s_channel_enable(s_tx);
+    }
+    if (s_rx) {
+        i2s_channel_enable(s_rx);
+    }
+    s_i2s_on = true;
+}
+
+/* PA 功放使能脚平时由 codec 驱动; 省电时主动拉成"关" */
+static void audio_pa_off(void)
+{
+#if CONFIG_TMX_AUDIO_PA_PIN >= 0
+    gpio_set_level((gpio_num_t)CONFIG_TMX_AUDIO_PA_PIN,
+                   CONFIG_TMX_AUDIO_PA_ACTIVE_LEVEL ? 0 : 1);
+#endif
 }
 
 static i2s_mclk_multiple_t mclk_multiple(void)
@@ -224,6 +267,16 @@ static void audio_task(void *arg)
     while (1) {
         if (!s_ready) {
             vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        /*
+         * 省电中: I2S 时钟是停的, 这时不能去碰 codec (读/写都会失败)。
+         * 有活干的时候 (要放音 / 开麦克风) 调用方会先 tmx_audio_power_save(false)
+         * 把时钟放回来再叫醒我们。
+         */
+        if (!s_i2s_on) {
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
             continue;
         }
 
@@ -358,6 +411,7 @@ esp_err_t tmx_audio_init(void)
         ESP_LOGE(TAG, "I2S 使能失败: %s", esp_err_to_name(err));
         goto fail;
     }
+    s_i2s_on = true;
 
     /* ---------- 2. I2C 总线 + ES8311 codec ---------- */
     err = tmx_i2c_begin(0, 0);
@@ -503,6 +557,7 @@ esp_err_t tmx_audio_play_tone(int freq_hz, int duration_ms, int volume_percent)
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
     }
+    tmx_audio_power_save(false);          /* 省电把时钟停了就先放回来 */
     if (freq_hz < 20) {
         freq_hz = 20;
     }
@@ -543,6 +598,7 @@ esp_err_t tmx_audio_say_text(const char *text, int speed)
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
     }
+    tmx_audio_power_save(false);
     if (!tmx_tts_is_ready()) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -569,6 +625,9 @@ void tmx_audio_stop(void)
 
 void tmx_audio_set_mic_reporting(bool enable)
 {
+    if (enable) {
+        tmx_audio_power_save(false);      /* 麦克风要采集, 先把 I2S 时钟放回来 */
+    }
     s_mic_on = enable;
     if (!enable) {
         s_mic_level = 0;
@@ -588,6 +647,38 @@ int tmx_audio_mic_level(void)
 bool tmx_audio_tts_active(void)
 {
     return tmx_tts_is_active();
+}
+
+/* 音频这块现在有没有活干 (有活干就不能进省电) */
+bool tmx_audio_busy(void)
+{
+    return s_tone_active || s_mic_on || tmx_tts_is_active();
+}
+
+/*
+ * 空闲省电 (由主循环的自动省电调用): 停 I2S 时钟 + 静音 + 关 PA 功放。
+ * 恢复是真的"恢复": 时钟一开, codec 那边不用重新配置 (寄存器还在)。
+ */
+void tmx_audio_power_save(bool on)
+{
+    if (!s_ready) {
+        return;
+    }
+    if (on) {
+        if (!s_i2s_on) {
+            return;                       /* 已经是省电状态 */
+        }
+        esp_codec_dev_set_out_mute(s_codec, true);
+        audio_pa_off();
+        audio_i2s_stop();
+        ESP_LOGI(TAG, "省电: 音频 I2S 时钟已停 (ES8311 静音, PA 关)");
+    } else {
+        if (s_i2s_on) {
+            return;
+        }
+        audio_i2s_resume();
+        ESP_LOGI(TAG, "省电结束: 音频 I2S 时钟已恢复");
+    }
 }
 
 /* ---------- TTS 回传 (PC 端存 wav / 验证用) ---------- */

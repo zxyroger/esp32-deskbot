@@ -807,6 +807,48 @@ def patch_esp32_gateway_power(path):
     return True, bak
 
 
+# ---- 补丁 14: 电池放电速率 (电量计换算, 0.1%/h) ----
+POWER_RATE_OLD = (
+    "        current_ma = 0\n"
+    "        if len(data) >= 8:\n"
+    "            raw = (data[6] << 8) | data[7]\n"
+    "            current_ma = raw - 65536 if raw & 0x8000 else raw\n"
+)
+
+POWER_RATE_NEW = POWER_RATE_OLD + (
+    "\n"
+    "        # 本地补丁 14: 放电速率 (0.1%/h, 负 = 放电; 老固件没有这 2 个字节)\n"
+    "        rate_pph_x10 = None\n"
+    "        if len(data) >= 10:\n"
+    "            raw_rate = (data[8] << 8) | data[9]\n"
+    "            rate_pph_x10 = raw_rate - 65536 if raw_rate & 0x8000 else raw_rate\n"
+)
+
+POWER_RATE_PAYLOAD_OLD = (
+    "            'current_ma': current_ma,\n"
+)
+
+POWER_RATE_PAYLOAD_NEW = (
+    "            'current_ma': current_ma,\n"
+    "            'rate_pph_x10': rate_pph_x10,\n"
+)
+
+
+def patch_esp32_gateway_power_rate(path):
+    """给补丁 13 的电池上报再加一个字段: 放电速率 (0.1%/h)"""
+    text = path.read_text(encoding="utf-8")
+    if "本地补丁 14" in text:
+        return False, None
+    if ("本地补丁 13" not in text or POWER_RATE_OLD not in text or
+            POWER_RATE_PAYLOAD_OLD not in text):
+        return None, None      # 补丁 13 还没打, 交给上层提示
+    bak = backup(path)
+    text = text.replace(POWER_RATE_OLD, POWER_RATE_NEW, 1)
+    text = text.replace(POWER_RATE_PAYLOAD_OLD, POWER_RATE_PAYLOAD_NEW, 1)
+    path.write_text(text, encoding="utf-8")
+    return True, bak
+
+
 def patch_esp32_gateway_camera(path):
     """让 esp32 网关支持摄像头积木; 返回 (是否改动, 备份路径)"""
     text = path.read_text(encoding="utf-8")
@@ -1077,6 +1119,16 @@ def main():
             print("  [13] 电池上报: 已是补丁状态, 无需改动")
         else:
             problems.append("esp32_gateway.py 里找不到摄像头补丁的代码, 请先检查补丁 9")
+
+        # ---- 补丁 14: 电池放电速率 (%/h) ----
+        changed, bak = patch_esp32_gateway_power_rate(esp32_gateway)
+        if changed:
+            print("  [14] 电池放电速率: 已加上 rate_pph_x10 (老固件会自动略过)")
+            print("        备份: %s" % bak)
+        elif changed is False:
+            print("  [14] 电池放电速率: 已是补丁状态, 无需改动")
+        else:
+            problems.append("esp32_gateway.py 里找不到电池上报补丁的代码, 请先检查补丁 13")
 
     # ---- 补丁 10: telemetrix 的 WiFi 读函数要读满 (一帧几十片, 必踩短读) ----
     transport = find_module_path("telemetrix_aio_esp32.socket_aio_transport")
