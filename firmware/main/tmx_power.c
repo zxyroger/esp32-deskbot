@@ -55,11 +55,21 @@ static const char *TAG = "tmx_power";
 #define MA_DELTA_REPORT   50      /* (估算)电流变化超过这么多 mA 就补一条 */
 
 /* 放电速率: 用内置电量计的百分比推算, 单位 0.1%/h (负 = 放电) */
-#define RATE_SAMPLE_MS    60000ULL        /* 每分钟记一个电量点 */
-#define RATE_MIN_SPAN_MS  600000ULL       /* 至少要跨 10 分钟才算数 */
+#define RATE_SAMPLE_MS    30000ULL        /* 每 30 秒记一个电量点 */
+#define RATE_MIN_SPAN_MS  60000ULL        /* 只要跨过 1 分钟, 而且电量掉过 1% 就出数 */
+#define RATE_ZERO_SPAN_MS 600000ULL       /* 跨过 10 分钟还一点没掉, 才敢说 "基本没在掉" */
 #define RATE_MAX_SPAN_MS  3600000ULL      /* 最多回看 1 小时 */
-#define RATE_HISTORY      64
+#define RATE_HISTORY      128
 #define RATE_STEP_X10     36000000LL      /* Δ% × 3.6e7 ÷ 窗口ms = 速率×10 */
+
+/*
+ * 还测不出来时的哨兵值 (见 tmx_core.c 的包格式说明):
+ * 电量计只有 1% 分辨率, 板子刚上电 / 刚拔 USB 时还没有任何变化可看, 这时候
+ * 报 0 是假数据 (板子明明在耗电)。所以用哨兵告诉扩展"还不知道", 让积木显示
+ * "测量中", 而不是骗人的 0。
+ */
+#define RATE_UNKNOWN      ((int)0x7FFF)
+#define MA_UNKNOWN        ((int)(-0x8000))
 
 static bool     s_ready;
 static uint64_t s_last_poll_ms;
@@ -79,6 +89,7 @@ static struct {
 static int      s_hist_count;
 static int      s_hist_head;
 static int      s_rate_x10;                 /* 平均放电速率 0.1%/h, 负 = 放电 */
+static bool     s_rate_valid;               /* false = 还没测出来 (别报 0) */
 
 static uint64_t now_ms(void)
 {
@@ -116,6 +127,7 @@ static void rate_history_reset(void)
     s_hist_count = 0;
     s_hist_head = 0;
     s_rate_x10 = 0;
+    s_rate_valid = false;
 }
 
 static void rate_history_push(uint64_t now, int percent)
@@ -139,10 +151,15 @@ static void rate_history_push(uint64_t now, int percent)
 
 /*
  * 用"最老的那个还在窗口内的点"到"最新点"的差值算平均速率。
- * 电量计 1% 一跳, 所以窗口里至少要有 1% 的变化才报, 否则保持上一次的值。
+ *
+ * 电量计 1% 一跳, 所以:
+ *   - 窗口里有变化 (Δ≠0) 且跨过 RATE_MIN_SPAN_MS  -> 直接算 (通常第一次掉 1% 就出数);
+ *   - 窗口里一点没变, 但已经跨过 RATE_ZERO_SPAN_MS -> 说明真的掉得极慢, 报 0;
+ *   - 其他情况 -> 还不知道 (valid = false), 让积木显示"测量中"。
  */
-static int rate_estimate_x10(uint64_t now)
+static int rate_estimate_x10(uint64_t now, bool *valid)
 {
+    *valid = false;
     if (s_hist_count < 2) {
         return 0;
     }
@@ -159,9 +176,17 @@ static int rate_estimate_x10(uint64_t now)
 
     uint64_t span = now - s_hist[oldest].ms;
     int delta = s_hist[newest].percent - s_hist[oldest].percent;
-    if (span < RATE_MIN_SPAN_MS || delta == 0) {
-        return s_rate_x10;              /* 数据还不够, 先沿用上一次 (可能是 0) */
+    if (delta == 0) {
+        if (span >= RATE_ZERO_SPAN_MS) {
+            *valid = true;
+            return 0;
+        }
+        return 0;
     }
+    if (span < RATE_MIN_SPAN_MS) {
+        return 0;
+    }
+    *valid = true;
     return (int)((int64_t)delta * RATE_STEP_X10 / (int64_t)span);
 }
 
@@ -259,8 +284,9 @@ esp_err_t tmx_power_read(tmx_power_info_t *out)
     }
 
     /* 电流是算出来的 (见文件头), 这里只填最近一次算出的平均值 */
-    out->rate_pph_x10 = s_rate_x10;
-    out->current_ma = rate_to_ma(s_rate_x10);
+    out->rate_valid = s_rate_valid;
+    out->rate_pph_x10 = s_rate_valid ? s_rate_x10 : RATE_UNKNOWN;
+    out->current_ma = s_rate_valid ? rate_to_ma(s_rate_x10) : MA_UNKNOWN;
     return ESP_OK;
 }
 
@@ -290,9 +316,15 @@ bool tmx_power_poll(tmx_power_info_t *out)
         rate_history_reset();
     } else {
         rate_history_push(now, info.percent);
-        s_rate_x10 = rate_estimate_x10(now);
-        info.rate_pph_x10 = s_rate_x10;
-        info.current_ma = rate_to_ma(s_rate_x10);
+        bool valid = false;
+        int rate = rate_estimate_x10(now, &valid);
+        if (valid) {
+            s_rate_x10 = rate;          /* 记下最近一次真正测出来的值 */
+        }
+        s_rate_valid = valid;
+        info.rate_valid = valid;
+        info.rate_pph_x10 = valid ? s_rate_x10 : RATE_UNKNOWN;
+        info.current_ma = valid ? rate_to_ma(s_rate_x10) : MA_UNKNOWN;
     }
 
     bool changed = (info.percent != s_last_percent) ||

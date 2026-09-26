@@ -18,6 +18,7 @@ typedef struct {
     int     vbus_mv;            /* VBUS(USB) 电压 mV, 0 = 没插 */
     int     percent;            /* 电量 0~100, -1 = 读不到 */
     int     rate_pph_x10;       /* 平均放电速率 0.1%/h: 负 = 放电, 正 = 在涨 */
+    bool    rate_valid;         /* false = 还没攒够数据, 上面两项是哨兵值 (别当 0 用) */
     int     current_ma;         /* 估算的平均电流 mA: 正 = 充电, 负 = 放电。
                                  * AXP2101 没有电流 ADC, 这是 速率×容量 换算出来的
                                  * (容量见 menuconfig TMX_BATTERY_CAPACITY_MAH)。 */

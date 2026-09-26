@@ -223,8 +223,12 @@ async function run() {
     check('电池电量 72', extension.batteryPercent(), 72);
     check('电池电压 4.07V', extension.batteryVoltage(), '4.07');
     check('电池状态: 充电中', extension.batteryState(), '充电中');
-    check('电池电流 (充电为正)', extension.batteryCurrent(), 180);
-    check('放电速度 (电量在涨就是负的)', extension.batteryRate(), '-18.0');
+    check('充电时电流积木说"充电中"而不是假数字', extension.batteryCurrent(), '充电中');
+    check('充电时放电速度积木说"充电中"', extension.batteryRate(), '充电中');
+    // 插着 USB 但没在充 (充满/外部供电): 也不是放电, 不该给假数字
+    lastSocket.message({ report: 'battery', present: true, external_power: true, charging: false,
+                         millivolts: 4100, percent: 100, vbus_millivolts: 4890 });
+    check('外部供电时电流积木说"外部供电"', extension.batteryCurrent(), '外部供电');
     lastSocket.message({ report: 'battery', present: true, external_power: false, charging: false,
                          millivolts: 3721, percent: 41, vbus_millivolts: 0, current_ma: -260,
                          rate_pph_x10: -130 });
@@ -232,14 +236,21 @@ async function run() {
     check('电池电压跟着变', extension.batteryVoltage(), '3.72');
     check('电池电流 (放电为负)', extension.batteryCurrent(), -260);
     check('放电速度 13%/小时', extension.batteryRate(), '13.0');
-    // 老网关 (补丁 14 之前) 不带 rate 字段 -> 显示空, 而不是 0
+    // 固件还没攒够数据时会发哨兵值 -> 显示"测量中", 而不是骗人的 0
+    lastSocket.message({ report: 'battery', present: true, external_power: false, charging: false,
+                         millivolts: 3721, percent: 41, vbus_millivolts: 0,
+                         current_ma: -32768, rate_pph_x10: 32767 });
+    check('还没测出电流时显示"测量中"', extension.batteryCurrent(), '测量中');
+    check('还没测出速率时显示"测量中"', extension.batteryRate(), '测量中');
+    // 老网关 (补丁 14 之前) 不带 rate 字段 -> 同样算"还不知道"
     lastSocket.message({ report: 'battery', present: true, external_power: false, charging: false,
                          millivolts: 3721, percent: 41, vbus_millivolts: 0, current_ma: -260 });
-    check('老网关没有速率字段时显示空', extension.batteryRate(), '');
+    check('老网关没有速率字段时也是"测量中"', extension.batteryRate(), '测量中');
     lastSocket.message({ report: 'battery', present: false, external_power: true, charging: false,
                          millivolts: 0, percent: 255, vbus_millivolts: 4890 });
     check('没接电池时电量为空', extension.batteryPercent(), '');
     check('电池状态: 未接电池', extension.batteryState(), '未接电池');
+    check('没接电池时电流为空', extension.batteryCurrent(), '');
 
     // 6) 没有 vm 时: 单张拍照要发对命令, 而且失败不能把积木卡死
     lastSocket.sent.length = 0;
