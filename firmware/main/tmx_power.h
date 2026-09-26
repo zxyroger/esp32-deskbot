@@ -17,6 +17,7 @@ typedef struct {
     int     battery_mv;         /* 电池电压 mV, 0 = 读不到 */
     int     vbus_mv;            /* VBUS(USB) 电压 mV, 0 = 没插 */
     int     percent;            /* 电量 0~100, -1 = 读不到 */
+    int     current_ma;         /* 电池电流 mA: 正 = 充电, 负 = 放电 (实测标定) */
 } tmx_power_info_t;
 
 /* 打开 AXP2101 的 VBAT/VBUS/VSYS ADC 通道并打一条初始日志 (幂等, 未就绪时返回错误) */
@@ -24,6 +25,10 @@ esp_err_t tmx_power_init(void);
 
 /* 立刻读一次 */
 esp_err_t tmx_power_read(tmx_power_info_t *out);
+
+/* 最近一次读到的供电状态: true = 外部(USB)供电, false = 电池供电。
+ * 还没读到过时返回 true (宁可保守, 不做省电)。 */
+bool tmx_power_external_power(void);
 
 /*
  * 由主循环调用: 默认每 2 秒看一次, 只有"电量变了 / 电压变了 20mV 以上 / 供电状态变了"

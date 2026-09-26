@@ -150,6 +150,7 @@
         this.batteryCharging = false;
         this.batteryMillivolts = 0;
         this.batteryPercentValue = -1;      // -1 = 还不知道
+        this.batteryCurrentMa = 0;          // 正 = 充电, 负 = 放电
         this.streamQuality = CAMERA_STREAM_DEFAULT_QUALITY;   // 「视频质量」积木设的
         this.qualityBeforeStream = -1;      // 开流前的拍照质量, 关流时还回去
     }
@@ -643,6 +644,12 @@
                     text: '电池状态',
                     arguments: {}
                 },
+                {
+                    opcode: 'batteryCurrent',
+                    blockType: Scratch.BlockType.REPORTER,
+                    text: '电池电流（mA）',
+                    arguments: {}
+                },
                 '---',
                 {
                     opcode: 'boardStatus',
@@ -806,6 +813,7 @@
                 self.batteryExternal = !!msg['external_power'];
                 self.batteryCharging = !!msg['charging'];
                 self.batteryMillivolts = parseInt(msg['millivolts'], 10) || 0;
+                self.batteryCurrentMa = parseInt(msg['current_ma'], 10) || 0;
                 var percent = parseInt(msg['percent'], 10);
                 // 固件用 255 表示"读不到", 网关会转成 -1; 这里只认 0~100, 其余当未知
                 self.batteryPercentValue = (isFinite(percent) && percent >= 0 && percent <= 100)
@@ -1460,6 +1468,11 @@
             return '充电中';
         }
         return this.batteryExternal ? '外部供电' : '电池供电';
+    };
+
+    /* 电池电流: 正 = 充电, 负 = 放电 (绝对值就是放电/充电电流) */
+    Esp32S3.prototype.batteryCurrent = function () {
+        return this.batteryCurrentMa;
     };
 
     // 收到一整帧: 存下 data URL, 变成当前角色的新造型, 再放行「拍照」积木

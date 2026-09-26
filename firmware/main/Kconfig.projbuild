@@ -139,6 +139,32 @@ menu "ESP32-S3 Scratch 服务器配置"
 
 endmenu
 
+menu "省电 (电池供电)"
+
+    config TMX_POWER_SAVE_AUTO
+        bool "电池供电 + 空闲时自动省电 (WiFi modem sleep + 关背光)"
+        default y
+        help
+            打开后: 板子检测到自己**在电池上**、并且一段时间没有命令、相机也没在出图时,
+            自动把 WiFi 切到 modem sleep (跟着 AP 的 DTIM 睡觉; 代价是下行会晚
+            ~100ms 醒来) 并关掉 LCD 背光; 一旦有命令进来 / 开始推流 / 插上 USB,
+            立刻恢复低延迟和背光。
+
+            这块板子电池上的常驻开销主要三块: WiFi(省电关掉时 ~80mA)、LCD 背光
+            (默认 80% 亮度, 几十 mA)、CPU 160MHz (由 DFS 自动降到 80MHz)。
+            实测"电池 + 空闲"下这三项一起降下来, 待机电流能降一大截。
+
+    config TMX_POWER_SAVE_IDLE_MS
+        int "多久没有命令才算空闲 (ms)"
+        range 1000 600000
+        default 10000
+        depends on TMX_POWER_SAVE_AUTO
+        help
+            超过这个时间没有任何命令、且相机没在推流, 就进省电。
+            调小=更省电但更容易感到"第一次点积木慢半拍"; 调大=响应更跟手。
+
+endmenu
+
 menu "LCD (ILI9342C, SPI 屏幕)"
 
     config TMX_LCD_ENABLE

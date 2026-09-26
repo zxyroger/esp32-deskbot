@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -29,6 +30,7 @@
 #include "tmx_io.h"
 #include "tmx_protocol.h"
 #include "display_ili9341.h"
+#include "wifi_link.h"
 #include "tmx_audio.h"
 #include "tmx_camera.h"
 #include "tmx_power.h"
@@ -60,6 +62,7 @@ typedef struct {
 static int           s_client = -1;
 static uint8_t       s_cmd_buffer[TMX_MAX_COMMAND_LEN];
 static bool          s_stop_reports;
+static uint64_t      s_last_command_ms;   /* 最近一条命令的时刻 (自动省电用) */
 static uint32_t      s_analog_interval_ms = TMX_ANALOG_DEFAULT_MS;
 static uint64_t      s_analog_last_ms;
 static uint64_t      s_sonar_last_ms;
@@ -249,6 +252,26 @@ esp_err_t tmx_core_init(void)
     s_stop_reports = false;
     s_analog_interval_ms = TMX_ANALOG_DEFAULT_MS;
     s_warned_commands = 0;
+    s_last_command_ms = now_ms();
+
+#if CONFIG_PM_ENABLE
+    /*
+     * DFS: 空闲时 CPU 自动降到 80MHz, 有负载再升回 160MHz (省十几~二十几 mA)。
+     * 不开 light sleep —— 那会影响串口日志和摄像头采集。
+     */
+    esp_pm_config_t pm_cfg = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = 80,
+        .light_sleep_enable = false,
+    };
+    esp_err_t pm_err = esp_pm_configure(&pm_cfg);
+    if (pm_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_pm_configure 失败 (%s), CPU 降频没开", esp_err_to_name(pm_err));
+    } else {
+        ESP_LOGI(TAG, "CPU 动态调频: %d ~ %d MHz (空闲降到 80MHz)",
+                 pm_cfg.min_freq_mhz, pm_cfg.max_freq_mhz);
+    }
+#endif
     return ESP_OK;
 }
 
@@ -946,9 +969,10 @@ static void scan_audio_input(void)
  * 每 2 秒看一次, 但只有"电量变了 / 电压变化 20mV 以上 / 供电状态变了"才发,
  * 另外每 30 秒补一条心跳 —— 免得每 2 秒刷一条小包。
  *
- * 包格式: 标志(1) 电池mV(2, 大端) 电量%(1) VBUS mV(2, 大端)
+ * 包格式: 标志(1) 电池mV(2, 大端) 电量%(1) VBUS mV(2, 大端) 电池电流mA(2, 大端有符号)
  *         标志 bit0 = 电池在位, bit1 = 外部(USB)供电, bit2 = 充电中
  *         电量 255 = 读不到
+ *         电流: 正 = 充电, 负 = 放电
  */
 static void scan_power(void)
 {
@@ -966,8 +990,8 @@ static void scan_power(void)
     if (info.charging) {
         flags |= 0x04;
     }
-    uint8_t packet[8];
-    packet[0] = 7;                       /* 之后的字节数 = 报告码(1) + 数据(6) */
+    uint8_t packet[10];
+    packet[0] = 9;                       /* 之后的字节数 = 报告码(1) + 数据(8) */
     packet[1] = TMX_REPORT_POWER;
     packet[2] = flags;
     packet[3] = (uint8_t)((info.battery_mv >> 8) & 0xff);
@@ -975,7 +999,42 @@ static void scan_power(void)
     packet[5] = (uint8_t)(info.percent < 0 ? 255 : info.percent);
     packet[6] = (uint8_t)((info.vbus_mv >> 8) & 0xff);
     packet[7] = (uint8_t)(info.vbus_mv & 0xff);
+    packet[8] = (uint8_t)((info.current_ma >> 8) & 0xff);
+    packet[9] = (uint8_t)(info.current_ma & 0xff);
     tmx_core_send(packet, sizeof(packet));
+}
+
+/*
+ * 自动省电 (电池供电时省电流的大头)。
+ *
+ * 这块板子电池上的常驻开销主要三块: WiFi(省电关掉时 ~80mA)、LCD 背光(80% 几十 mA)、
+ * CPU 160MHz。这里做的是: **电池供电 + 空闲(一段时间没命令、相机也没在出图)** 时
+ *   1. WiFi 进 modem sleep (跟着 AP 的 DTIM 睡觉, 下行晚 ~100ms 醒来);
+ *   2. 关掉 LCD 背光。
+ * 一旦有命令进来 / 开始推流 / 插上 USB, 立刻恢复原状 (延迟优先)。
+ * CPU 那一路由 DFS 负责 (见 tmx_core_init 里的 esp_pm_configure)。
+ */
+static void scan_power_save(void)
+{
+#if CONFIG_TMX_POWER_SAVE_AUTO
+    static bool s_saving;
+
+    uint64_t now = now_ms();
+    bool on_battery = !tmx_power_external_power();
+    bool idle = (now - s_last_command_ms) >= CONFIG_TMX_POWER_SAVE_IDLE_MS;
+    bool streaming = (tmx_camera_state() == TMX_CAMERA_STATE_STREAM);
+    bool want = on_battery && idle && !streaming;
+
+    if (want == s_saving) {
+        return;
+    }
+    s_saving = want;
+    wifi_link_set_power_save(want);
+    display_ili9341_power_save(want);
+    ESP_LOGI(TAG, "自动省电 %s (电池供电=%d 空闲=%d 推流中=%d)",
+             want ? "开: WiFi modem sleep + 关背光" : "关: 恢复低延迟 + 背光",
+             (int)on_battery, (int)idle, (int)streaming);
+#endif
 }
 
 /* TTS 回传: 把音频任务攒下的合成 PCM 按包发给 PC (PC 侧存成 wav) */
@@ -1066,6 +1125,9 @@ static bool read_one_command(void)
     send_debug(packet_length, command);
 #endif
 
+    /* 有命令进来就说明有人在用: 记一下, 自动省电会因此退出 */
+    s_last_command_ms = now_ms();
+
     switch (command) {
         case TMX_CMD_LOOPBACK:                     cmd_loopback(); break;
         case TMX_CMD_SET_PIN_MODE:                 cmd_set_pin_mode(); break;
@@ -1126,6 +1188,8 @@ bool tmx_core_poll(void)
     scan_tts_mirror();
     /* 电池: 电压/电量/充电状态 (变化时上报, 30 秒心跳) */
     scan_power();
+    /* 自动省电: 电池供电 + 空闲时把 WiFi/背光降下来 */
+    scan_power_save();
     /* 摄像头: 该拍就拍, 有帧要发就分片发给 PC */
     tmx_camera_poll();
 

@@ -32,6 +32,11 @@ CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
 # 生效, 而 ESP-IDF 默认是**关**的 —— 之前那几次"板子连不上"就是这个。
 CONFIG_LWIP_TCP_KEEPALIVE=y
 
+# 电源管理: 只用来做 DFS (空闲时 CPU 160MHz -> 80MHz, 省十几~二十几 mA)。
+# 不开 light sleep —— 那会影响串口日志和摄像头采集。
+# 电池上的大项由 "省电 (电池供电)" 那组 Kconfig 管 (WiFi modem sleep + 关背光)。
+CONFIG_PM_ENABLE=y
+
 # 板载 I2C 总线: SDA=GPIO1 / SCL=GPIO2 (总线上挂着 ES8311 音频 codec, 地址 0x30)
 CONFIG_TMX_I2C_SDA_PIN=1
 CONFIG_TMX_I2C_SCL_PIN=2

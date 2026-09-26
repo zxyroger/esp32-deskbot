@@ -29,6 +29,7 @@ static const char *TAG = "tmx_power";
 #define REG_STATUS2       0x01
 #define REG_ADC_ENABLE    0x30
 #define REG_VBAT_H        0x34
+#define REG_IBAT_H        0x36
 #define REG_VBUS_H        0x38
 #define REG_VSYS_H        0x3A
 #define REG_PERCENT       0xA4
@@ -38,6 +39,7 @@ static const char *TAG = "tmx_power";
 #define POLL_INTERVAL_MS  2000
 #define HEARTBEAT_MS      30000
 #define MV_DELTA_REPORT   20      /* 电压变化超过这么多 mV 就补一条 */
+#define MA_DELTA_REPORT   100     /* 电流变化超过这么多 mA 就补一条 (相机开关机差几百 mA) */
 
 static bool     s_ready;
 static uint64_t s_last_poll_ms;
@@ -45,6 +47,8 @@ static uint64_t s_last_report_ms;
 static int      s_last_mv = -1;
 static int      s_last_percent = -2;
 static bool     s_last_external;
+static int      s_last_ma = 0;
+static bool     s_external_seen = true;     /* 还没读到过时按"外部供电"算 */
 
 static uint64_t now_ms(void)
 {
@@ -76,6 +80,26 @@ static bool write_reg(uint8_t reg, uint8_t value)
     return tmx_i2c_write(AXP_ADDR, buf, sizeof(buf)) == ESP_OK;
 }
 
+/*
+ * 电池电流: 0x36/0x37, 13 位有符号, 0.5mA/LSB。
+ * 符号约定按数据手册: 正 = 充电(电流流进电池), 负 = 放电。
+ */
+static bool read_current_ma(int *milliamp)
+{
+    uint8_t data[2] = { 0, 0 };
+    size_t len = 0;
+    if (tmx_i2c_read(AXP_ADDR, REG_IBAT_H, 2, false, data, sizeof(data), &len) != ESP_OK ||
+            len != 2) {
+        return false;
+    }
+    int raw = (int)(((uint16_t)(data[0] & 0x1F) << 8) | data[1]);
+    if (raw & 0x1000) {                 /* 13 位补码 -> 有符号 */
+        raw -= 0x2000;
+    }
+    *milliamp = raw / 2;                /* 0.5mA/LSB */
+    return true;
+}
+
 esp_err_t tmx_power_init(void)
 {
     if (s_ready) {
@@ -101,8 +125,8 @@ esp_err_t tmx_power_init(void)
 
     tmx_power_info_t info;
     if (tmx_power_read(&info) == ESP_OK) {
-        ESP_LOGI(TAG, "电池: %d mV, 电量 %d%%, 电池%s, %s, VBUS %d mV",
-                 info.battery_mv, info.percent,
+        ESP_LOGI(TAG, "电池: %d mV, %d mA, 电量 %d%%, 电池%s, %s, VBUS %d mV",
+                 info.battery_mv, info.current_ma, info.percent,
                  info.battery_present ? "在位" : "未接",
                  info.charging ? "充电中"
                                : (info.external_power ? "外部供电" : "电池供电"),
@@ -147,6 +171,13 @@ esp_err_t tmx_power_read(tmx_power_info_t *out)
     } else {
         out->percent = -1;
     }
+
+    int ma = 0;
+    if (read_current_ma(&ma)) {
+        out->current_ma = ma;
+    } else {
+        out->current_ma = 0;
+    }
     return ESP_OK;
 }
 
@@ -166,18 +197,22 @@ bool tmx_power_poll(tmx_power_info_t *out)
     if (tmx_power_read(&info) != ESP_OK) {
         return false;
     }
+    s_external_seen = info.external_power;
 
     bool changed = (info.percent != s_last_percent) ||
                    (info.external_power != s_last_external) ||
                    (s_last_mv < 0) ||
                    (info.battery_mv > 0 && (info.battery_mv - s_last_mv > MV_DELTA_REPORT ||
-                                            s_last_mv - info.battery_mv > MV_DELTA_REPORT));
+                                            s_last_mv - info.battery_mv > MV_DELTA_REPORT)) ||
+                   (info.current_ma - s_last_ma > MA_DELTA_REPORT ||
+                    s_last_ma - info.current_ma > MA_DELTA_REPORT);
     bool heartbeat = (s_last_report_ms == 0) ||
                      ((now - s_last_report_ms) >= HEARTBEAT_MS);
 
     s_last_mv = info.battery_mv;
     s_last_percent = info.percent;
     s_last_external = info.external_power;
+    s_last_ma = info.current_ma;
 
     if (!changed && !heartbeat) {
         return false;
@@ -187,4 +222,9 @@ bool tmx_power_poll(tmx_power_info_t *out)
         *out = info;
     }
     return true;
+}
+
+bool tmx_power_external_power(void)
+{
+    return s_external_seen;
 }

@@ -158,16 +158,12 @@ static void backlight_init(void)
     s_backlight_ready = true;
 }
 
-void display_ili9341_set_backlight(uint8_t percent)
+/* 用户/命令设置过的亮度 (省电结束后按它恢复) */
+static uint8_t s_user_percent;
+static bool    s_power_saving;
+
+static void apply_backlight(uint8_t percent)
 {
-    if (!s_backlight_ready) {
-        return;   /* 屏幕没初始化 (或没启用), 直接忽略 */
-    }
-
-    if (percent > 100) {
-        percent = 100;
-    }
-
 #if CONFIG_TMX_LCD_BACKLIGHT_PWM
     uint32_t duty = (LCD_BL_DUTY_MAX * percent) / 100u;
     ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)CONFIG_TMX_LCD_BACKLIGHT_LEDC_CHANNEL, duty);
@@ -181,6 +177,33 @@ void display_ili9341_set_backlight(uint8_t percent)
     }
     gpio_set_level((gpio_num_t)CONFIG_TMX_LCD_BACKLIGHT_PIN, level);
 #endif
+}
+
+void display_ili9341_set_backlight(uint8_t percent)
+{
+    if (!s_backlight_ready) {
+        return;   /* 屏幕没初始化 (或没启用), 直接忽略 */
+    }
+    if (percent > 100) {
+        percent = 100;
+    }
+    s_user_percent = percent;
+    if (!s_power_saving) {
+        apply_backlight(percent);
+    }
+}
+
+/*
+ * 省电模式: 临时把背光关掉 (背光是这块板子上最稳的一笔常驻开销, 80% 大概几十 mA),
+ * 退出时按"用户/命令最近设置的亮度"恢复。
+ */
+void display_ili9341_power_save(bool on)
+{
+    if (!s_backlight_ready || on == s_power_saving) {
+        return;
+    }
+    s_power_saving = on;
+    apply_backlight(on ? 0 : s_user_percent);
 }
 
 /* ------------------------------------------------------------------ */

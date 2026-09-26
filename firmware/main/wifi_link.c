@@ -43,6 +43,13 @@ const char *wifi_link_ip_string(void)
     return s_ip_string;
 }
 
+void wifi_link_set_power_save(bool on)
+{
+    /* 省电模式会牺牲一点下行延迟换电流, 所以只在"电池供电 + 空闲"时才用
+     * (见 tmx_core.c 的自动省电逻辑)。 */
+    esp_wifi_set_ps(on ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE);
+}
+
 #if CONFIG_TMX_USE_STATIC_IP
 static void apply_static_ip(void)
 {

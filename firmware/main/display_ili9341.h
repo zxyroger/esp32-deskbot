@@ -29,6 +29,9 @@ esp_lcd_panel_handle_t display_ili9341_panel(void);
 /* 背光亮度 0 ~ 100 */
 void display_ili9341_set_backlight(uint8_t percent);
 
+/* 省电模式: 关掉背光 (退出时恢复用户设置的亮度) */
+void display_ili9341_power_save(bool on);
+
 /* 全屏填充 RGB565 颜色, 例如 0xF800 = 红 */
 esp_err_t display_ili9341_fill(uint16_t rgb565_color);
 
