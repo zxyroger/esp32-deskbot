@@ -10,6 +10,7 @@ idf_component_register(
         "tmx_audio.c"
         "tmx_tts.c"
         "tmx_camera.c"
+        "tmx_power.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi

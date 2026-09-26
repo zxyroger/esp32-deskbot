@@ -31,6 +31,7 @@
 #include "display_ili9341.h"
 #include "tmx_audio.h"
 #include "tmx_camera.h"
+#include "tmx_power.h"
 
 static const char *TAG = "tmx_core";
 
@@ -940,6 +941,43 @@ static void scan_audio_input(void)
 #endif
 }
 
+/*
+ * 电池: 电压 / 电量 / 充电状态 (AXP2101 自带电量计)。
+ * 每 2 秒看一次, 但只有"电量变了 / 电压变化 20mV 以上 / 供电状态变了"才发,
+ * 另外每 30 秒补一条心跳 —— 免得每 2 秒刷一条小包。
+ *
+ * 包格式: 标志(1) 电池mV(2, 大端) 电量%(1) VBUS mV(2, 大端)
+ *         标志 bit0 = 电池在位, bit1 = 外部(USB)供电, bit2 = 充电中
+ *         电量 255 = 读不到
+ */
+static void scan_power(void)
+{
+    tmx_power_info_t info;
+    if (!tmx_power_poll(&info)) {
+        return;
+    }
+    uint8_t flags = 0;
+    if (info.battery_present) {
+        flags |= 0x01;
+    }
+    if (info.external_power) {
+        flags |= 0x02;
+    }
+    if (info.charging) {
+        flags |= 0x04;
+    }
+    uint8_t packet[8];
+    packet[0] = 7;                       /* 之后的字节数 = 报告码(1) + 数据(6) */
+    packet[1] = TMX_REPORT_POWER;
+    packet[2] = flags;
+    packet[3] = (uint8_t)((info.battery_mv >> 8) & 0xff);
+    packet[4] = (uint8_t)(info.battery_mv & 0xff);
+    packet[5] = (uint8_t)(info.percent < 0 ? 255 : info.percent);
+    packet[6] = (uint8_t)((info.vbus_mv >> 8) & 0xff);
+    packet[7] = (uint8_t)(info.vbus_mv & 0xff);
+    tmx_core_send(packet, sizeof(packet));
+}
+
 /* TTS 回传: 把音频任务攒下的合成 PCM 按包发给 PC (PC 侧存成 wav) */
 static void scan_tts_mirror(void)
 {
@@ -1086,6 +1124,8 @@ bool tmx_core_poll(void)
         scan_audio_input();
     }
     scan_tts_mirror();
+    /* 电池: 电压/电量/充电状态 (变化时上报, 30 秒心跳) */
+    scan_power();
     /* 摄像头: 该拍就拍, 有帧要发就分片发给 PC */
     tmx_camera_poll();
 

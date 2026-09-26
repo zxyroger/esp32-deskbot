@@ -741,6 +741,67 @@ CAMERA_GW_DISPATCH_NEW = CAMERA_GW_DISPATCH_OLD + (
 )
 
 
+# ---- 补丁 13: 电池电压/电量上报 (AXP2101 电量计) ----
+POWER_GW_CONST_OLD = (
+    "TMX_REPORT_CAMERA_INFO = 0x12       # 状态(1) 宽(2) 高(2) 质量(1) 分辨率索引(1) XCLK MHz(1)\n"
+)
+
+POWER_GW_CONST_NEW = POWER_GW_CONST_OLD + (
+    "TMX_REPORT_POWER = 0x14             # 本地补丁 13: 标志(1) 电池mV(2) 电量%(1) VBUS mV(2)\n"
+)
+
+POWER_GW_DISPATCH_OLD = (
+    "        self.esp.report_dispatch[TMX_REPORT_CAMERA_INFO] = self._camera_info\n"
+)
+
+POWER_GW_DISPATCH_NEW = POWER_GW_DISPATCH_OLD + (
+    "\n"
+    "        # 本地补丁 13: 电池上报 (0x14) 转成 Scratch 能看的字段\n"
+    "        self.esp.report_dispatch[TMX_REPORT_POWER] = self._power_report\n"
+)
+
+POWER_GW_METHOD_OLD = (
+    "    # ---- 本地补丁 9: 摄像头 (OV2640) ----\n"
+)
+
+POWER_GW_METHOD_NEW = (
+    "    # ---- 本地补丁 13: 电池 (AXP2101 电量计) ----\n"
+    "\n"
+    "    async def _power_report(self, data):\n"
+    "        \"\"\"0x14: 标志(1) 电池mV(2,大端) 电量%(1) VBUS mV(2,大端)\"\"\"\n"
+    "        if len(data) < 6:\n"
+    "            return\n"
+    "        flags = data[0]\n"
+    "        await self.publish_payload({\n"
+    "            'report': 'battery',\n"
+    "            'present': bool(flags & 0x01),\n"
+    "            'external_power': bool(flags & 0x02),\n"
+    "            'charging': bool(flags & 0x04),\n"
+    "            'millivolts': (data[1] << 8) | data[2],\n"
+    "            'percent': data[3] if data[3] <= 100 else -1,\n"
+    "            'vbus_millivolts': (data[4] << 8) | data[5],\n"
+    "        }, 'from_esp32_gateway')\n"
+    "\n"
+    "    # ---- 本地补丁 9: 摄像头 (OV2640) ----\n"
+)
+
+
+def patch_esp32_gateway_power(path):
+    """让 esp32 网关把电池上报 (0x14) 转给 Scratch; 返回 (是否改动, 备份路径)"""
+    text = path.read_text(encoding="utf-8")
+    if "本地补丁 13" in text:
+        return False, None
+    if (POWER_GW_CONST_OLD not in text or POWER_GW_DISPATCH_OLD not in text or
+            POWER_GW_METHOD_OLD not in text):
+        return None, None      # 补丁 9 (摄像头) 还没打, 交给上层提示
+    bak = backup(path)
+    text = text.replace(POWER_GW_CONST_OLD, POWER_GW_CONST_NEW, 1)
+    text = text.replace(POWER_GW_DISPATCH_OLD, POWER_GW_DISPATCH_NEW, 1)
+    text = text.replace(POWER_GW_METHOD_OLD, POWER_GW_METHOD_NEW, 1)
+    path.write_text(text, encoding="utf-8")
+    return True, bak
+
+
 def patch_esp32_gateway_camera(path):
     """让 esp32 网关支持摄像头积木; 返回 (是否改动, 备份路径)"""
     text = path.read_text(encoding="utf-8")
@@ -1001,6 +1062,16 @@ def main():
             print("  [9/11] 摄像头积木: 已是补丁状态, 无需改动")
         else:
             problems.append("esp32_gateway.py 里找不到朗读文字补丁的代码, 请先检查补丁 8")
+
+        # ---- 补丁 13: 电池电压/电量上报 (0x14) ----
+        changed, bak = patch_esp32_gateway_power(esp32_gateway)
+        if changed:
+            print("  [13] 电池上报: 已把 0x14 (电压/电量/充电状态) 转给 Scratch")
+            print("        备份: %s" % bak)
+        elif changed is False:
+            print("  [13] 电池上报: 已是补丁状态, 无需改动")
+        else:
+            problems.append("esp32_gateway.py 里找不到摄像头补丁的代码, 请先检查补丁 9")
 
     # ---- 补丁 10: telemetrix 的 WiFi 读函数要读满 (一帧几十片, 必踩短读) ----
     transport = find_module_path("telemetrix_aio_esp32.socket_aio_transport")

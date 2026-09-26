@@ -83,6 +83,7 @@
 #define TMX_REPORT_CAMERA_STATUS             17  /* 状态(1) + 数值(1) */
 #define TMX_REPORT_CAMERA_INFO               18  /* 状态(1) 宽(2) 高(2) 质量(1) 分辨率索引(1) XCLK MHz(1) */
 #define TMX_REPORT_CAMERA_PROBE              19  /* 探针: 类型(1) + 边沿数(2, 大端) */
+#define TMX_REPORT_POWER                     20  /* 标志(1) 电池mV(2) 电量%(1) VBUS mV(2) */
 #define TMX_REPORT_DEBUG_PRINT               99
 
 /* 固件版本 —— 与官方 Telemetrix4Esp32 (3.2.0) 对齐，PC 端只做打印 */
