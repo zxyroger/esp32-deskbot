@@ -138,6 +138,8 @@
         this.videoLastError = '';           // 最近一次画失败的原因 (给人看的)
         this.videoLastArrivalAt = 0;        // 最近收到一帧的时刻 (看门狗用)
         this.videoLastDrawAt = 0;           // 最近画成功一帧的时刻 (看门狗用)
+        this.videoAliveAt = 0;              // "这条流还活着"的时刻 (板子重启后靠它发现)
+        this.lastReviveAt = 0;              // 上次自动重开流的时刻 (节流用)
         this.videoRecoveries = 0;           // 看门狗自动重画了几次
         this.reportsReceived = 0;           // 一共收到多少条板上/网关上报 (调试用)
         this.lastReport = '';               // 最近一条上报的类型
@@ -696,6 +698,7 @@
             self.videoLastError = '';
             self.videoLastArrivalAt = 0;
             self.videoLastDrawAt = 0;
+            self.videoAliveAt = 0;
             // 正在等启动器拉起服务时, 别把"正在启动"盖成"未连接"
             if (self.launching) {
                 self.setStatus('starting');
@@ -1282,6 +1285,7 @@
         this.videoFpsAt = Date.now();
         this.videoLastArrivalAt = 0;
         this.videoLastDrawAt = 0;
+        this.videoAliveAt = Date.now();     // 从现在开始算"还没有画面"
         /* 视频用更小的帧 (帧率能翻倍), 关的时候把拍照质量还回去。
          * 重开时别覆盖 qualityBeforeStream —— 那时它记的已经是「视频质量」了,
          * 覆盖掉的话关流时就会把视频质量当成原来的拍照质量还回去。 */
@@ -1309,6 +1313,7 @@
         this.videoLastError = '';
         this.videoLastArrivalAt = 0;
         this.videoLastDrawAt = 0;
+        this.videoAliveAt = 0;
         this.send({ command: 'camera_stop' }, true);
         if (this.qualityBeforeStream >= 0) {
             // 流期间借用了质量设置, 还回去 (下次"拍一张照片"还是原来的清晰度)
@@ -1437,6 +1442,7 @@
         }
         this.videoLastFrame = msg;
         this.videoLastArrivalAt = Date.now();
+        this.videoAliveAt = Date.now();
         if (this.videoBusy) {
             this.videoDropped++;
             return;
@@ -1519,6 +1525,22 @@
                 this.noteCamera('本地服务断了，正在重连并重开摄像头…');
                 this.openVideo();
             }
+            return;
+        }
+        /*
+         * "服务连着、但板子那头已经没有流了": 板子换电源 / 被复位 / 重启之后会自己
+         * 回到空闲状态, 而扩展这边 wantVideo 还是 true —— 以前这种情况画面就一直
+         * 定格, 必须人工再点一次「打开摄像头」(2026-09-26 换电池供电时真踩到:
+         * 板子重启后 IP 也从 .100 变成 .103)。这里补上自动重开: 8 秒没有画面就
+         * 重发一遍命令; 10 秒最多一次, 因为板子上电 + 预热本身要 3 秒, 重发太密
+         * 反而会把它打断。
+         */
+        if (this.wantVideo && this.socketOpen() && this.videoAliveAt &&
+                (Date.now() - this.videoAliveAt) > 8000 &&
+                (Date.now() - (this.lastReviveAt || 0)) > 10000) {
+            this.lastReviveAt = Date.now();
+            this.noteCamera('好一会儿没有画面了（板子重启过？），正在重新开流…');
+            this.openVideo();
             return;
         }
         if (!this.videoOn || !this.videoLastFrame) {

@@ -365,6 +365,19 @@ async function run() {
         reconnectedSocket.sent.some((m) => m.command === 'camera_snapshot'), true);
     check('重连后视频状态自己恢复', extension.videoOn, true);
 
+    // 9f-2) 板子重启/换电源: 服务连着但板子那头没有流了 -> 扩展要自己重新开流
+    extension.wantVideo = true;
+    extension.videoOn = true;
+    extension.videoAliveAt = Date.now() - 9000;        // 9 秒没有画面
+    extension.videoLastArrivalAt = Date.now() - 9000;
+    extension.lastReviveAt = 0;
+    lastSocket.sent.length = 0;
+    extension.videoWatchdog();
+    await delay(10);
+    check('长时间没有画面时自动重新开流 (板子重启后不用人工点积木)',
+        lastSocket.sent.some((m) => m.command === 'camera_snapshot'), true);
+    check('自动重开后仍是流式播放', extension.videoOn, true);
+
     // 9g) 调试上报: 连着的时候必须能发出来 (排障靠它)
     lastSocket.sent.length = 0;
     extension.videoDiag();
