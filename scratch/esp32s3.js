@@ -144,6 +144,12 @@
         this.reportsReceived = 0;           // 一共收到多少条板上/网关上报 (调试用)
         this.lastReport = '';               // 最近一条上报的类型
         this.lastReportAt = 0;              // 最近一条上报的时刻
+        // 电池 (AXP2101 电量计, 固件上报 0x14)
+        this.batteryPresent = false;
+        this.batteryExternal = false;       // 现在是不是由 USB/VBUS 供电
+        this.batteryCharging = false;
+        this.batteryMillivolts = 0;
+        this.batteryPercentValue = -1;      // -1 = 还不知道
         this.streamQuality = CAMERA_STREAM_DEFAULT_QUALITY;   // 「视频质量」积木设的
         this.qualityBeforeStream = -1;      // 开流前的拍照质量, 关流时还回去
     }
@@ -619,6 +625,24 @@
                     text: '照片（数据 URL）',
                     arguments: {}
                 },
+                {
+                    opcode: 'batteryPercent',
+                    blockType: Scratch.BlockType.REPORTER,
+                    text: '电池电量（%）',
+                    arguments: {}
+                },
+                {
+                    opcode: 'batteryVoltage',
+                    blockType: Scratch.BlockType.REPORTER,
+                    text: '电池电压（V）',
+                    arguments: {}
+                },
+                {
+                    opcode: 'batteryState',
+                    blockType: Scratch.BlockType.REPORTER,
+                    text: '电池状态',
+                    arguments: {}
+                },
                 '---',
                 {
                     opcode: 'boardStatus',
@@ -776,6 +800,16 @@
                     self.noteCamera('收到没人要的视频帧（板子上还有流没停），已让它停流');
                     self.send({ command: 'camera_stop' }, true);
                 }
+            } else if (report === 'battery') {
+                // 电池电压/电量/充电状态 (固件上报 0x14, AXP2101 自带电量计)
+                self.batteryPresent = !!msg['present'];
+                self.batteryExternal = !!msg['external_power'];
+                self.batteryCharging = !!msg['charging'];
+                self.batteryMillivolts = parseInt(msg['millivolts'], 10) || 0;
+                var percent = parseInt(msg['percent'], 10);
+                // 固件用 255 表示"读不到", 网关会转成 -1; 这里只认 0~100, 其余当未知
+                self.batteryPercentValue = (isFinite(percent) && percent >= 0 && percent <= 100)
+                    ? percent : -1;
             }
             // 有板子数据回来 = 整条链路 (Scratch→网关→板子→回传) 是通的
             if (self.statusState === 'connecting') {
@@ -1406,6 +1440,26 @@
 
     Esp32S3.prototype.photoData = function () {
         return this.photoDataUrl;
+    };
+
+    /* 电池 (AXP2101 电量计): 板子每 2 秒看一次, 有变化或 30 秒心跳时才发上报 0x14 */
+
+    Esp32S3.prototype.batteryPercent = function () {
+        return this.batteryPercentValue < 0 ? '' : this.batteryPercentValue;
+    };
+
+    Esp32S3.prototype.batteryVoltage = function () {
+        return this.batteryMillivolts > 0 ? (this.batteryMillivolts / 1000).toFixed(2) : '';
+    };
+
+    Esp32S3.prototype.batteryState = function () {
+        if (!this.batteryPresent) {
+            return '未接电池';
+        }
+        if (this.batteryCharging) {
+            return '充电中';
+        }
+        return this.batteryExternal ? '外部供电' : '电池供电';
     };
 
     // 收到一整帧: 存下 data URL, 变成当前角色的新造型, 再放行「拍照」积木

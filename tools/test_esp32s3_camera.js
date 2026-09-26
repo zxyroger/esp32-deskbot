@@ -215,6 +215,22 @@ async function run() {
     check('摄像头出错时的提示', extension.cameraState(),
         '摄像头出错（连续失败 3 次），看串口日志');
 
+    // 5b) 电池上报 (0x14 -> gateway -> battery)
+    check('还没收到电池上报时电量为空', extension.batteryPercent(), '');
+    lastSocket.message({ report: 'battery', present: true, external_power: true, charging: true,
+                         millivolts: 4069, percent: 72, vbus_millivolts: 4898 });
+    check('电池电量 72', extension.batteryPercent(), 72);
+    check('电池电压 4.07V', extension.batteryVoltage(), '4.07');
+    check('电池状态: 充电中', extension.batteryState(), '充电中');
+    lastSocket.message({ report: 'battery', present: true, external_power: false, charging: false,
+                         millivolts: 3721, percent: 41, vbus_millivolts: 0 });
+    check('电池状态: 电池供电', extension.batteryState(), '电池供电');
+    check('电池电压跟着变', extension.batteryVoltage(), '3.72');
+    lastSocket.message({ report: 'battery', present: false, external_power: true, charging: false,
+                         millivolts: 0, percent: 255, vbus_millivolts: 4890 });
+    check('没接电池时电量为空', extension.batteryPercent(), '');
+    check('电池状态: 未接电池', extension.batteryState(), '未接电池');
+
     // 6) 没有 vm 时: 单张拍照要发对命令, 而且失败不能把积木卡死
     lastSocket.sent.length = 0;
     let photoDone = false;
