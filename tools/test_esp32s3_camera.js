@@ -251,6 +251,12 @@ async function run() {
     check('没接电池时电量为空', extension.batteryPercent(), '');
     check('电池状态: 未接电池', extension.batteryState(), '未接电池');
     check('没接电池时电流为空', extension.batteryCurrent(), '');
+    // 固件读不到 PMIC (I2C 没应答) -> 明确说"读不到", 不要挂着旧值装正常
+    lastSocket.message({ report: 'battery', present: true, external_power: true, charging: false,
+                         millivolts: 0, percent: 255, vbus_millivolts: 0, read_error: true });
+    check('读不到时电量显示空', extension.batteryPercent(), '');
+    check('读不到时电压显示空', extension.batteryVoltage(), '');
+    check('读不到时状态说"读不到"', extension.batteryState(), '读不到（检查电池接线）');
 
     // 6) 没有 vm 时: 单张拍照要发对命令, 而且失败不能把积木卡死
     lastSocket.sent.length = 0;

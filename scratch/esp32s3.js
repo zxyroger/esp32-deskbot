@@ -148,6 +148,7 @@
         this.batteryPresent = false;
         this.batteryExternal = false;       // 现在是不是由 USB/VBUS 供电
         this.batteryCharging = false;
+        this.batteryReadError = false;       // 固件读不到 PMIC (I2C 没应答)
         this.batteryMillivolts = 0;
         this.batteryPercentValue = -1;      // -1 = 还不知道
         this.batteryCurrentMa = null;       // 正 = 充电, 负 = 放电 (估算); null = 还没测出来
@@ -819,6 +820,7 @@
                 self.batteryPresent = !!msg['present'];
                 self.batteryExternal = !!msg['external_power'];
                 self.batteryCharging = !!msg['charging'];
+                self.batteryReadError = !!msg['read_error'];
                 self.batteryMillivolts = parseInt(msg['millivolts'], 10) || 0;
                 // 电流/速率都是固件用电量计换算的估算值。固件还没攒够数据时用哨兵
                 // (电流 0x8000 / 速率 0x7FFF); 老网关干脆没有 rate 字段 —— 都当"还不知道",
@@ -1474,6 +1476,10 @@
     };
 
     Esp32S3.prototype.batteryState = function () {
+        if (this.batteryReadError) {
+            // 固件明确告诉我们"读不到" (PMIC 没应答), 这时候别拿旧值骗人
+            return '读不到（检查电池接线）';
+        }
         if (!this.batteryPresent) {
             return '未接电池';
         }
@@ -1491,6 +1497,9 @@
      * 变化之前显示"测量中"(固件报哨兵值), 不显示 0。
      */
     Esp32S3.prototype.batteryCurrent = function () {
+        if (this.batteryReadError) {
+            return '';
+        }
         if (!this.batteryPresent) {
             return '';
         }
@@ -1505,6 +1514,9 @@
 
     /* 电池放电速度 (%/小时): 正 = 在放电, 负 = 电量在涨 (充电中) */
     Esp32S3.prototype.batteryRate = function () {
+        if (this.batteryReadError) {
+            return '';
+        }
         if (!this.batteryPresent) {
             return '';
         }

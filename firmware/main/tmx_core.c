@@ -972,6 +972,7 @@ static void scan_audio_input(void)
  * 包格式: 标志(1) 电池mV(2, 大端) 电量%(1) VBUS mV(2, 大端)
  *         电池电流mA(2, 大端有符号, 估算) 放电速率(2, 大端有符号, 0.1%/h)
  *         标志 bit0 = 电池在位, bit1 = 外部(USB)供电, bit2 = 充电中
+ *                bit3 = 读不到 (PMIC 没应答, 这时别的字段都别信)
  *         电量 255 = 读不到; VBUS = 0 表示没插 USB
  *         电流/速率: 正 = 充电(电量在涨), 负 = 放电
  *         还没测出来时: 速率 = 0x7FFF, 电流 = 0x8000 (哨兵值, 积木显示"测量中");
@@ -994,6 +995,9 @@ static void scan_power(void)
     }
     if (info.charging) {
         flags |= 0x04;
+    }
+    if (info.read_error) {
+        flags |= 0x08;
     }
     uint8_t packet[12];
     packet[0] = 11;                      /* 之后的字节数 = 报告码(1) + 数据(10) */

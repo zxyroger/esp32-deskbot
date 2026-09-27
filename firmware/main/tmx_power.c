@@ -26,6 +26,8 @@
 
 #include "tmx_power.h"
 
+#include <string.h>
+
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -91,6 +93,11 @@ static int      s_hist_head;
 static int      s_rate_x10;                 /* 平均放电速率 0.1%/h, 负 = 放电 */
 static bool     s_rate_valid;               /* false = 还没测出来 (别报 0) */
 static int      s_fail_streak;              /* 连续读失败次数 (用来发现 I2C 掉线) */
+static int      s_mv_avg;                   /* 电压滑均, 给"按电压估电量"用 */
+static int      s_gauge_percent = -1;       /* 电量计 (0xA4) 原始值, 只做诊断 */
+static uint64_t s_last_error_ms;            /* 上次上报"读不到"的时刻 */
+static bool     s_last_battery_present = true;
+static int      s_bad_mv_streak;            /* 电压连续几次不合理 (悬空/断线) */
 
 static uint64_t now_ms(void)
 {
@@ -129,6 +136,38 @@ static void rate_history_reset(void)
     s_hist_head = 0;
     s_rate_x10 = 0;
     s_rate_valid = false;
+}
+
+/*
+ * 用电压估电量 (单节锂电, 轻载静置曲线)。
+ *
+ * 为什么不直接用 AXP2101 的电量计: 它的电量计要先把**一份 128 字节的电池参数表**
+ * 写进 ROM (XPowersLib 的 writeGaugeData, 寄存器 0xA2/0xA1, 复位 0x17) 才能算准,
+ * 那张表得跟实际电芯配套。我们没写、也拿不到配套表, 于是 0xA4 出来的是芯片默认
+ * 值 —— 实测同一个电芯上它一会儿 0% 一会儿 25%, 而电压一直稳在 4.1~4.2V,
+ * 这数字没法用。电压曲线虽然粗糙 (锂电 3.7~4.0V 那段很平, 中段 ±10% 是正常的),
+ * 但单调、稳定、和实际状态对得上, 做"还能用多久"的判断足够了。
+ */
+static int percent_from_mv(int mv)
+{
+    static const struct { int mv; int pct; } k[] = {
+        { 4200, 100 }, { 4100, 90 }, { 4000, 78 }, { 3950, 70 }, { 3900, 62 },
+        { 3850, 55 },  { 3800, 47 }, { 3750, 40 }, { 3700, 32 }, { 3650, 25 },
+        { 3600, 18 },  { 3500, 10 }, { 3400, 5 },  { 3300, 2 },  { 3000, 0 },
+    };
+    const int n = (int)(sizeof(k) / sizeof(k[0]));
+
+    if (mv >= k[0].mv) {
+        return 100;
+    }
+    for (int i = 0; i + 1 < n; i++) {
+        if (mv >= k[i + 1].mv) {
+            int span = k[i].mv - k[i + 1].mv;           /* > 0 */
+            int dpct = k[i].pct - k[i + 1].pct;
+            return k[i + 1].pct + (mv - k[i + 1].mv) * dpct / span;
+        }
+    }
+    return 0;
 }
 
 static void rate_history_push(uint64_t now, int percent)
@@ -229,9 +268,9 @@ esp_err_t tmx_power_init(void)
 
     tmx_power_info_t info;
     if (tmx_power_read(&info) == ESP_OK) {
-        ESP_LOGI(TAG, "电池: %d mV, 电量 %d%%, 电池%s, %s, VBUS %d mV "
-                      "(电流是电量计换算的, 要先跑几分钟)",
-                 info.battery_mv, info.percent,
+        ESP_LOGI(TAG, "电池: %d mV, 电量 %d%% (按电压算; 电量计原始值 %d%%), "
+                      "电池%s, %s, VBUS %d mV",
+                 info.battery_mv, info.percent, s_gauge_percent,
                  info.battery_present ? "在位" : "未接",
                  info.charging ? "充电中"
                                : (info.external_power ? "外部供电" : "电池供电"),
@@ -245,6 +284,8 @@ esp_err_t tmx_power_read(tmx_power_info_t *out)
     if (out == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    memset(out, 0, sizeof(*out));
+    out->read_error = false;
 
     uint8_t status1 = 0;
     uint8_t status2 = 0;
@@ -277,11 +318,50 @@ esp_err_t tmx_power_read(tmx_power_info_t *out)
     (void)REG_VSYS_H;   /* VSYS 暂时不用, 留着以后要显示系统电压时读 */
     (void)REG_VTST_H;   /* TS 是电池 NTC 温度, 不是电流 */
 
-    uint8_t percent = 0;
-    if (out->battery_present && read_reg(REG_PERCENT, &percent) && percent <= 100) {
-        out->percent = (int)percent;
+    /* 电量计原始值 (仅供参考, 见 percent_from_mv 上面的说明) */
+    uint8_t gauge = 0;
+    if (out->battery_present && read_reg(REG_PERCENT, &gauge) && gauge <= 100) {
+        s_gauge_percent = (int)gauge;
     } else {
+        s_gauge_percent = -1;
+    }
+
+    /*
+     * 上报的电量: 默认按电压算 (理由见 percent_from_mv)。电压先做个 8 秒滑均,
+     * 免得开摄像头那一下的压降直接变成"掉了一大截电"。
+     */
+    bool mv_plausible = (out->battery_mv >= 2800 && out->battery_mv <= 4400);
+    if (out->battery_mv > 0 && mv_plausible) {
+        s_mv_avg = (s_mv_avg == 0) ? out->battery_mv
+                                   : (s_mv_avg * 3 + out->battery_mv) / 4;
+    }
+    if (!out->battery_present) {
         out->percent = -1;
+        s_bad_mv_streak = 0;
+    } else if (!mv_plausible) {
+        /*
+         * 单节锂电不可能低于 2.8V 或高于 4.4V (充电时最高 4.2V)。
+         * 读到这种值基本就是"引脚悬空": 电池没接牢、或者保护板拉闸了 ——
+         * 这时候**不能**按电压曲线算成 0% 然后显示一个"没电了"的假象,
+         * 要明确说"读不到"。连续 3 次 (~6 秒) 才算, 免得被单次毛刺带偏。
+         */
+        if (++s_bad_mv_streak >= 3) {
+            out->read_error = true;
+            out->percent = -1;
+            if (s_bad_mv_streak == 3) {
+                ESP_LOGW(TAG, "电池电压读数不合理 (%d mV, 单节锂电应在 2.8~4.4V): "
+                              "电池没接好 / 保护板拉闸? 先按'读不到'处理",
+                         out->battery_mv);
+            }
+        } else {
+            out->percent = -1;
+        }
+    } else if (CONFIG_TMX_BATTERY_PERCENT_FROM_VOLTAGE) {
+        s_bad_mv_streak = 0;
+        out->percent = (s_mv_avg > 0) ? percent_from_mv(s_mv_avg) : -1;
+    } else {
+        s_bad_mv_streak = 0;
+        out->percent = s_gauge_percent;
     }
 
     /* 电流是算出来的 (见文件头), 这里只填最近一次算出的平均值 */
@@ -317,12 +397,30 @@ bool tmx_power_poll(tmx_power_info_t *out)
             rate_history_reset();
             s_ready = false;
         }
+        /*
+         * 读不到也要让 PC 知道: 否则积木上会一直挂着上一次的旧值 (最常见的就是
+         * 一个假的 0%), 用户根本分不清"真没电"还是"读不到"。每 30 秒补一条
+         * "读不到", 恢复后自然又变成真数据。
+         */
+        if (s_fail_streak >= 5 && (now - s_last_error_ms) >= HEARTBEAT_MS) {
+            s_last_error_ms = now;
+            if (out != NULL) {
+                memset(out, 0, sizeof(*out));
+                out->read_error = true;
+                out->battery_present = s_last_battery_present;
+                out->percent = -1;
+                out->rate_pph_x10 = RATE_UNKNOWN;
+                out->current_ma = MA_UNKNOWN;
+            }
+            return true;
+        }
         return false;
     }
     if (s_fail_streak > 0) {
         ESP_LOGI(TAG, "电池读数恢复 (之前连续失败 %d 次)", s_fail_streak);
         s_fail_streak = 0;
     }
+    s_last_battery_present = info.battery_present;
     s_external_seen = info.external_power;
 
     /*

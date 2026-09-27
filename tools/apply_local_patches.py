@@ -849,6 +849,42 @@ def patch_esp32_gateway_power_rate(path):
     return True, bak
 
 
+# ---- 补丁 15: 电池"读不到"状态 (flags bit3) ----
+POWER_ERR_OLD = (
+    "        flags = data[0]\n"
+)
+
+POWER_ERR_NEW = (
+    "        flags = data[0]\n"
+    "        # 本地补丁 15: bit3 = PMIC 没应答 (读不到), 这时别的字段都别信\n"
+    "        read_error = bool(flags & 0x08)\n"
+)
+
+POWER_ERR_PAYLOAD_OLD = (
+    "            'charging': bool(flags & 0x04),\n"
+)
+
+POWER_ERR_PAYLOAD_NEW = (
+    "            'charging': bool(flags & 0x04),\n"
+    "            'read_error': read_error,\n"
+)
+
+
+def patch_esp32_gateway_power_error(path):
+    """让网关把电池上报的 bit3 (PMIC 读不到) 转给 Scratch"""
+    text = path.read_text(encoding="utf-8")
+    if "本地补丁 15" in text:
+        return False, None
+    if ("本地补丁 14" not in text or POWER_ERR_OLD not in text or
+            POWER_ERR_PAYLOAD_OLD not in text):
+        return None, None
+    bak = backup(path)
+    text = text.replace(POWER_ERR_OLD, POWER_ERR_NEW, 1)
+    text = text.replace(POWER_ERR_PAYLOAD_OLD, POWER_ERR_PAYLOAD_NEW, 1)
+    path.write_text(text, encoding="utf-8")
+    return True, bak
+
+
 def patch_esp32_gateway_camera(path):
     """让 esp32 网关支持摄像头积木; 返回 (是否改动, 备份路径)"""
     text = path.read_text(encoding="utf-8")
@@ -1129,6 +1165,16 @@ def main():
             print("  [14] 电池放电速率: 已是补丁状态, 无需改动")
         else:
             problems.append("esp32_gateway.py 里找不到电池上报补丁的代码, 请先检查补丁 13")
+
+        # ---- 补丁 15: 电池"读不到"状态 ----
+        changed, bak = patch_esp32_gateway_power_error(esp32_gateway)
+        if changed:
+            print("  [15] 电池读不到: 已把 bit3 转成 read_error (老固件没有这一位)")
+            print("        备份: %s" % bak)
+        elif changed is False:
+            print("  [15] 电池读不到: 已是补丁状态, 无需改动")
+        else:
+            problems.append("esp32_gateway.py 里找不到电池放电速率补丁的代码, 请先检查补丁 14")
 
     # ---- 补丁 10: telemetrix 的 WiFi 读函数要读满 (一帧几十片, 必踩短读) ----
     transport = find_module_path("telemetrix_aio_esp32.socket_aio_transport")
