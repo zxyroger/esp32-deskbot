@@ -179,6 +179,25 @@ menu "省电 (电池供电)"
             超过这个时间没有任何命令、且相机没在推流, 就进省电。
             调小=更省电但更容易感到"第一次点积木慢半拍"; 调大=响应更跟手。
 
+    config TMX_WIFI_TX_POWER_DBM
+        int "WiFi 发射功率 (dBm, 外部/USB 供电时)"
+        range 2 20
+        default 20
+        help
+            板子默认用 WiFi 允许的最大功率发射。插着 USB 时不用省, 保持 20dBm。
+
+    config TMX_WIFI_TX_POWER_BATTERY_DBM
+        int "WiFi 发射功率 (dBm, 电池供电时)"
+        range 2 20
+        default 11
+        help
+            电池供电时把发射功率降下来。原因: 这块板子上最大的电流尖峰来自
+            "WiFi 发射 + 摄像头", 小电池 / 1A 保护板撑不住, 一开摄像头整机就
+            掉电 (路由器那边看到板子直接消失, 表现出来就是"切到电池就没画面")。
+
+            11dBm 大概能把发射尖峰砍掉一百多 mA, 近距离 (同一个房间) 完全够用;
+            隔墙掉线就往上调 (13~15)。插上 USB 会自动恢复成上面那个值。
+
 endmenu
 
 menu "LCD (ILI9342C, SPI 屏幕)"

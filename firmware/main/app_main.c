@@ -14,6 +14,7 @@
 
 #include "esp_log.h"
 #include "esp_idf_version.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
@@ -36,12 +37,37 @@ static void init_nvs(void)
     ESP_ERROR_CHECK(err);
 }
 
+/*
+ * 上次为什么复位 —— 电池供电时最有用的一条日志。
+ * "切到电池一开摄像头板子就没了"如果真是电池带不动, 这里会看到 BROWNOUT;
+ * 如果是 AXP2101 被拉到欠压关机, 下一句会是 POWERON (从零上电)。
+ */
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_POWERON:  return "POWERON (刚上电/掉电重启)";
+        case ESP_RST_EXT:      return "EXT (外部复位脚)";
+        case ESP_RST_SW:       return "SW (软件 esp_restart)";
+        case ESP_RST_PANIC:    return "PANIC (程序崩溃)";
+        case ESP_RST_INT_WDT:  return "INT_WDT (中断看门狗)";
+        case ESP_RST_TASK_WDT: return "TASK_WDT (任务看门狗)";
+        case ESP_RST_WDT:      return "WDT (看门狗)";
+        case ESP_RST_DEEPSLEEP:return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT (电压被拉垮!)";
+        case ESP_RST_SDIO:     return "SDIO";
+        case ESP_RST_USB:      return "USB (USB 外设复位)";
+        case ESP_RST_JTAG:     return "JTAG";
+        default:               return "UNKNOWN";
+    }
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "=================================================");
     ESP_LOGI(TAG, " ESP32-S3 Scratch (OneGPIO / s3-extend) server");
     ESP_LOGI(TAG, " ESP-IDF: %s   chip: %s", esp_get_idf_version(), CONFIG_IDF_TARGET);
     ESP_LOGI(TAG, " TCP port: %d", CONFIG_TMX_TCP_PORT);
+    ESP_LOGI(TAG, " 上次复位: %s", reset_reason_name(esp_reset_reason()));
     ESP_LOGI(TAG, "=================================================");
 
     init_nvs();

@@ -50,6 +50,27 @@ void wifi_link_set_power_save(bool on)
     esp_wifi_set_ps(on ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE);
 }
 
+void wifi_link_set_tx_power(bool on_battery)
+{
+    /*
+     * esp_wifi_set_max_tx_power() 的单位是 0.25dBm (8~84 -> 2~21dBm), 所以
+     * 这边按 dBm 写、乘 4 再传进去。
+     */
+    int dbm = on_battery ? CONFIG_TMX_WIFI_TX_POWER_BATTERY_DBM
+                         : CONFIG_TMX_WIFI_TX_POWER_DBM;
+    if (dbm < 2) {
+        dbm = 2;
+    } else if (dbm > 20) {
+        dbm = 20;                 /* 驱动上限 21dBm, 留一点余量 */
+    }
+    esp_err_t err = esp_wifi_set_max_tx_power((int8_t)(dbm * 4));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "设置 WiFi 发射功率 %ddBm 失败: %s", dbm, esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "WiFi 发射功率: %d dBm (%s)", dbm, on_battery ? "电池" : "外部供电");
+    }
+}
+
 #if CONFIG_TMX_USE_STATIC_IP
 static void apply_static_ip(void)
 {

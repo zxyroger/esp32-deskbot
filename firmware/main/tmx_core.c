@@ -1025,11 +1025,22 @@ static void scan_power(void)
  */
 static void scan_power_save(void)
 {
-#if CONFIG_TMX_POWER_SAVE_AUTO
     static bool s_saving;
+    static int  s_tx_mode = -1;          /* -1 = 还没设过发射功率 */
 
     uint64_t now = now_ms();
     bool on_battery = !tmx_power_external_power();
+
+    /*
+     * 发射功率只跟"在不在电池上"有关, 跟空闲无关 —— 要削的正是"开摄像头那一下"
+     * 和 WiFi 发射撞在一起形成的电流尖峰, 电池撑不住就会整机掉电。
+     */
+    if ((on_battery ? 1 : 0) != s_tx_mode) {
+        s_tx_mode = on_battery ? 1 : 0;
+        wifi_link_set_tx_power(on_battery);
+    }
+
+#if CONFIG_TMX_POWER_SAVE_AUTO
     bool idle = (now - s_last_command_ms) >= CONFIG_TMX_POWER_SAVE_IDLE_MS;
     bool streaming = (tmx_camera_state() == TMX_CAMERA_STATE_STREAM);
     bool audio_busy = tmx_audio_busy();
