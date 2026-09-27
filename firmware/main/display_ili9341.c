@@ -161,6 +161,7 @@ static void backlight_init(void)
 /* 用户/命令设置过的亮度 (省电结束后按它恢复) */
 static uint8_t s_user_percent;
 static bool    s_power_saving;
+static uint8_t s_save_percent;      /* 省电期间用的亮度 */
 
 static void apply_backlight(uint8_t percent)
 {
@@ -199,11 +200,23 @@ void display_ili9341_set_backlight(uint8_t percent)
  */
 void display_ili9341_power_save(bool on)
 {
-    if (!s_backlight_ready || on == s_power_saving) {
+    display_ili9341_power_save_at(on, 0);
+}
+
+void display_ili9341_power_save_at(bool on, uint8_t percent)
+{
+    if (!s_backlight_ready) {
         return;
     }
+    if (percent > 100) {
+        percent = 100;
+    }
+    if (on == s_power_saving && (!on || percent == s_save_percent)) {
+        return;                          /* 已经是这个状态了 */
+    }
     s_power_saving = on;
-    apply_backlight(on ? 0 : s_user_percent);
+    s_save_percent = percent;
+    apply_backlight(on ? percent : s_user_percent);
 }
 
 /* ------------------------------------------------------------------ */

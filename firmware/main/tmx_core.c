@@ -1041,6 +1041,11 @@ static void scan_power_save(void)
     }
 
 #if CONFIG_TMX_POWER_SAVE_AUTO
+    /*
+     * 省电只在**真的空闲**时才做: 电池供电 + 一段时间没命令 + 没在推流 + 没在
+     * 放音/开麦克风。只要还有任务 (推流、放音、朗读、麦克风), 背光和音频都必须
+     * 保持正常工作 —— 省电不能妨碍干活。
+     */
     bool idle = (now - s_last_command_ms) >= CONFIG_TMX_POWER_SAVE_IDLE_MS;
     bool streaming = (tmx_camera_state() == TMX_CAMERA_STATE_STREAM);
     bool audio_busy = tmx_audio_busy();
@@ -1054,7 +1059,8 @@ static void scan_power_save(void)
     display_ili9341_power_save(want);
     tmx_audio_power_save(want);
     ESP_LOGI(TAG, "自动省电 %s (电池供电=%d 空闲=%d 推流中=%d 音频忙=%d)",
-             want ? "开: WiFi modem sleep + 关背光 + 停音频" : "关: 恢复低延迟 + 背光 + 音频",
+             want ? "开: WiFi modem sleep + 关背光 + 停音频"
+                  : "关: 恢复低延迟 + 背光 + 音频",
              (int)on_battery, (int)idle, (int)streaming, (int)audio_busy);
 #endif
 }

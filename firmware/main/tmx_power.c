@@ -90,6 +90,7 @@ static int      s_hist_count;
 static int      s_hist_head;
 static int      s_rate_x10;                 /* 平均放电速率 0.1%/h, 负 = 放电 */
 static bool     s_rate_valid;               /* false = 还没测出来 (别报 0) */
+static int      s_fail_streak;              /* 连续读失败次数 (用来发现 I2C 掉线) */
 
 static uint64_t now_ms(void)
 {
@@ -304,7 +305,23 @@ bool tmx_power_poll(tmx_power_info_t *out)
 
     tmx_power_info_t info;
     if (tmx_power_read(&info) != ESP_OK) {
+        /*
+         * 读不到时**不能一声不吭**: 以前这里直接 return, 于是"电池积木再也没数据"
+         * 这种故障在串口上一点痕迹都没有, 只能靠猜。现在连续 5 次 (~10 秒) 读不到
+         * 就报一条警告, 并且把模块退回未初始化 —— 下一轮会重新初始化 PMIC
+         * (重新打开 VBAT/VBUS/VSYS 的 ADC 通道), 能自愈的就自愈。
+         */
+        if (++s_fail_streak == 5) {
+            ESP_LOGW(TAG, "电池读数连续 %d 次失败 (I2C 没应答 / PMIC 状态异常?), "
+                          "重新初始化 PMIC", s_fail_streak);
+            rate_history_reset();
+            s_ready = false;
+        }
         return false;
+    }
+    if (s_fail_streak > 0) {
+        ESP_LOGI(TAG, "电池读数恢复 (之前连续失败 %d 次)", s_fail_streak);
+        s_fail_streak = 0;
     }
     s_external_seen = info.external_power;
 

@@ -32,6 +32,13 @@ void display_ili9341_set_backlight(uint8_t percent);
 /* 省电模式: 关掉背光 (退出时恢复用户设置的亮度) */
 void display_ili9341_power_save(bool on);
 
+/*
+ * 同上, 但省电期间用指定的亮度 (0 = 全关, 100 = 不压)。
+ * 电池供电推流时用它把背光压暗 —— 背光是这块板上仅次于 WiFi/摄像头的一笔
+ * 常驻开销 (80% 亮度几十 mA), 而看视频的人通常在电脑那边, 不需要屏幕亮着。
+ */
+void display_ili9341_power_save_at(bool on, uint8_t percent);
+
 /* 全屏填充 RGB565 颜色, 例如 0xF800 = 红 */
 esp_err_t display_ili9341_fill(uint16_t rgb565_color);
 
