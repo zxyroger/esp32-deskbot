@@ -45,6 +45,11 @@ esp_err_t tmx_servo_attach(int pin, uint16_t min_pulse_us, uint16_t max_pulse_us
 esp_err_t tmx_servo_write(int pin, int angle);
 esp_err_t tmx_servo_detach(int pin);
 
+/* 把引脚从 PWM/舵机 (LEDC) 手里收回, 恢复成普通 GPIO: 没配过就是空操作。
+ * 积木把同一个脚从"舵机/PWM"改成"数字引脚"时, 固件在 set_pin_mode 里调它,
+ * 否则 LEDC 通道还占着这个脚 (通道池也少一路)。 */
+esp_err_t tmx_ledc_detach(int pin);
+
 /* ---------------- HC-SR04 超声波 ---------------- */
 esp_err_t tmx_sonar_register(int trigger_pin, int echo_pin);
 /* 返回厘米值, 超时/未接传感器返回 0 */

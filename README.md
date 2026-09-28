@@ -52,6 +52,7 @@ onegpio/
 │  ├─ test_esp32s3_status.js   扩展"连接状态"逻辑的冒烟测试 (假 WebSocket)
 │  ├─ test_esp32s3_autostart.js 扩展"点积木自动拉起服务"逻辑的冒烟测试
 │  ├─ test_esp32s3_audio.js  扩展"音频积木"的冒烟测试 (检查发出去的报文)
+│  ├─ test_esp32s3_pins.js   扩展"引脚积木"的冒烟测试 (GPIO10/11 + 换模式要重发 set_mode)
 │  ├─ test_gateway_audio.py  网关"音频积木"补丁的自检 (检查翻译出的协议字节)
 │  ├─ pc_audio_loopback_check.py 真机音频自检: 放音调同时读麦克风 (自听回环)
 │  ├─ pc_tts_check.py        真机 TTS 自检: 发文字让板子念, 并回传 PCM 存 wav
@@ -339,6 +340,11 @@ ESP32-S3 与经典 ESP32 的引脚不同，Scratch 扩展的引脚下拉框是�
   默认就会补），以及 **GPIO43/44**（UART0 的 TX/RX；本工程日志走原生 USB，
   所以这两脚空着，只是扩展的下拉框里没有）；
   GPIO2 是 I2C SCL（接了音频/摄像头之后别当普通 IO 用）
+* **GPIO10 / GPIO11 是普通 GPIO 管脚**：数字读写、PWM、舵机三种积木都能选，
+  不是只能当舵机用。同一个脚来回换模式时，固件会先把占着它的 LEDC 通道停掉、
+  把引脚收回成普通 GPIO 再配置（串口打印
+  `pin 11: PWM/servo channel released, back to plain GPIO`），所以"先玩舵机、
+  再当数字口用"不用重启板子，那条通道也会立刻还给别的脚
 * 其它经典引脚各有归属：**21** 屏幕 CS、**39/40/41/42** 屏幕与背光、
   **12/13/14/38/45/47** 音频、**3~9/15~18/46/48** 摄像头（见下面各节）
 * **GPIO22 / 23 / 25**：ESP32-S3 上不存在，选了不会有任何反应

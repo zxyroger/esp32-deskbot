@@ -220,6 +220,10 @@ esp_err_t tmx_gpio_input(int pin, bool pullup, bool pulldown)
         return err;
     }
 
+    /* 这个脚可能刚被 PWM/舵机 (LEDC) 用过 (积木从"舵机引脚"换成"数字引脚").
+     * 不先收回通道, 脚还挂在 LEDC 的输出上, 就不是"普通 GPIO 管脚"了。 */
+    tmx_ledc_detach(pin);
+
     gpio_config_t cfg = {
         .intr_type = GPIO_INTR_DISABLE,
         .mode = GPIO_MODE_INPUT,
@@ -236,6 +240,9 @@ esp_err_t tmx_gpio_output(int pin)
     if (err != ESP_OK) {
         return err;
     }
+
+    /* 同上: 先把 PWM/舵机的 LEDC 通道收回来, 再当普通 GPIO 输出 */
+    tmx_ledc_detach(pin);
 
     gpio_config_t cfg = {
         .intr_type = GPIO_INTR_DISABLE,
@@ -314,6 +321,9 @@ esp_err_t tmx_adc_configure(int pin)
                       "(可用 32..39 别名 / GPIO1..10, 见 docs/pins-esp32s3.md)", pin);
         return ESP_ERR_NOT_SUPPORTED;
     }
+
+    /* 同一个脚之前要是拿去做 PWM/舵机了, 先把它收回成普通脚再配 ADC */
+    tmx_ledc_detach(pin);
 
     if (!s_adc1_ready) {
         adc_oneshot_unit_init_cfg_t unit_cfg = {
@@ -511,14 +521,22 @@ esp_err_t tmx_pwm_write(int pin, uint32_t duty)
     return ledc_update_duty(TMX_LEDC_MODE, slot->channel);
 }
 
-esp_err_t tmx_pwm_detach(int pin)
+/* 通用的"把脚从 PWM/舵机手里收回": PWM 与舵机共用同一个通道池, 所以不分模式,
+ * 这个脚上不管占的是哪一路都停掉, 引脚恢复成普通 GPIO。 */
+esp_err_t tmx_ledc_detach(int pin)
 {
     ledc_slot_t *slot = slot_for_pin(pin);
     if (!slot) {
         return ESP_OK;
     }
+    ESP_LOGI(TAG, "pin %d: PWM/servo channel released, back to plain GPIO", pin);
     slot_release(slot);
     return ESP_OK;
+}
+
+esp_err_t tmx_pwm_detach(int pin)
+{
+    return tmx_ledc_detach(pin);
 }
 
 esp_err_t tmx_servo_attach(int pin, uint16_t min_pulse_us, uint16_t max_pulse_us)
