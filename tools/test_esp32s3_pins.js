@@ -78,7 +78,10 @@ const info = extension.getInfo();
 const digitalPins = info.menus.digitalPins.items;
 check('下拉框有 GPIO10', digitalPins.includes('10'), true);
 check('下拉框有 GPIO11', digitalPins.includes('11'), true);
+check('下拉框有 GPIO43 (U0TXD)', digitalPins.includes('43'), true);
+check('下拉框有 GPIO44 (U0RXD)', digitalPins.includes('44'), true);
 check('下拉框第 4/5 项就是 10 11', digitalPins.slice(3, 5), ['10', '11']);
+check('下拉框最后两项是 43 44', digitalPins.slice(-2), ['43', '44']);
 
 const pinMenuOf = (opcode) => {
     const block = info.blocks.filter((b) => typeof b === 'object' && b.opcode === opcode)[0];
@@ -142,9 +145,25 @@ check('超声波用 10 触发 / 11 回波', lastSocket.sent, [
     { command: 'set_mode_sonar', trigger_pin: 10, echo_pin: 11 }
 ]);
 
+/* 4b) U0TXD/U0RXD = GPIO43/44, 单独再走一遍数字输出和舵机 */
+lastSocket.sent.length = 0;
+extension.digitalWrite({ PIN: 43, VALUE: 1 });
+check('43 (U0TXD) 当数字输出', lastSocket.sent, [
+    { command: 'set_mode_digital_output', pin: 43 },
+    { command: 'digital_write', pin: 43, value: 1 }
+]);
+
+lastSocket.sent.length = 0;
+extension.servoWrite({ PIN: 44, ANGLE: 0 });
+check('44 (U0RXD) 当舵机', lastSocket.sent, [
+    { command: 'set_mode_servo', pin: 44 },
+    { command: 'servo_position', pin: 44, position: 0 }
+]);
+
 /* 5) 固件侧: 三种"收回 LEDC"的入口 + 实现都在 */
 const io = fs.readFileSync(ioFile, 'utf8');
 const header = fs.readFileSync(ioHeader, 'utf8');
+const patchScript = fs.readFileSync(path.join(__dirname, 'apply_local_patches.py'), 'utf8');
 const countOf = (text, needle) => text.split(needle).length - 1;
 check('tmx_io.h 声明 tmx_ledc_detach', header.includes('esp_err_t tmx_ledc_detach(int pin);'), true);
 check('tmx_io.c 实现 tmx_ledc_detach', countOf(io, 'esp_err_t tmx_ledc_detach(int pin)'), 1);
@@ -152,6 +171,11 @@ check('数字输入/输出 + ADC 三处都收回 LEDC',
     (io.match(/^\s+tmx_ledc_detach\(pin\);/gm) || []).length, 3);
 check('tmx_pwm_detach 走同一个实现',
     /esp_err_t tmx_pwm_detach\(int pin\)\s*\{\s*return tmx_ledc_detach\(pin\);/.test(io), true);
+check('网关补丁默认放行 10 11 43 44',
+    /extra_pins = args\.pins if args\.pins else \[10, 11, 43, 44\]/.test(patchScript), true);
+check('日志走 UART0 时固件收回 43/44',
+    /CONFIG_ESP_CONSOLE_UART_DEFAULT \|\| CONFIG_ESP_CONSOLE_UART_CUSTOM[\s\S]{0,400}?pin == 43 \|\| pin == 44/
+        .test(io), true);
 
 console.log(failures === 0 ? '\n全部通过' : `\n有 ${failures} 条不过`);
 process.exit(failures === 0 ? 0 : 1);

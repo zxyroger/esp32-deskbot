@@ -131,6 +131,15 @@ bool tmx_pin_is_reserved(int pin)
         return true;
     }
 #endif
+#if CONFIG_ESP_CONSOLE_UART_DEFAULT || CONFIG_ESP_CONSOLE_UART_CUSTOM
+    /* 日志改回 UART0 时, GPIO43/44 就是控制台串口的 TX/RX (原理图上写 U0TXD/U0RXD),
+     * 积木再去翻转它等于跟日志抢引脚, 所以默认拒收。
+     * 本工程默认日志走原生 USB (CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG), 这两个脚空着,
+     * 积木可以直接当数字口/PWM/舵机用。 */
+    if (pin == 43 || pin == 44) {
+        return true;
+    }
+#endif
     return false;
 #endif
 }

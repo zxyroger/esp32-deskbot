@@ -4,9 +4,9 @@
 给已安装的第三方包打上六个本地补丁 (幂等, pip 升级后可以再跑一次)。
 
 补丁 1: telemetrix_aio_esp32 的"合法引脚"表
-    它那份表是照经典 ESP32 抄的, 不含 10/11 等引脚。结果用积木选 10/11 时,
+    它那份表是照经典 ESP32 抄的, 不含 10/11/43/44 这些脚。结果用积木选它们时,
     PC 端在本地就把命令拦下来 (报 Invalid GPIO pin number), 板子毫无反应。
-    这里把指定引脚补进 GPIO 输入 / GPIO 输出 / 舵机三张表 (默认 10 11)。
+    这里把指定引脚补进 GPIO 输入 / GPIO 输出 / 舵机三张表 (默认 10 11 43 44)。
 
 补丁 2: python_banyan 用 psutil 扫进程时的 NoSuchProcess
     banyan_base_aio.py 在自动发现 backplane 时会遍历所有进程:
@@ -105,8 +105,8 @@
     客户端, 继续给其他人发"。
 
 用法:
-    python tools\\apply_local_patches.py            # 放行 10, 11
-    python tools\\apply_local_patches.py 10 11 4   # 指定额外放行的引脚
+    python tools\\apply_local_patches.py                  # 放行 10, 11, 43, 44
+    python tools\\apply_local_patches.py 10 11 43 44 4    # 指定额外放行的引脚
 
 打完补丁要重启网关才生效:
     Get-Process esp32gw -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -1044,9 +1044,9 @@ def patch_telemetrix_dispatch_guard(path):
 def main():
     parser = argparse.ArgumentParser(description="给第三方包打本地补丁")
     parser.add_argument("pins", nargs="*", type=int, default=None,
-                        help="额外放行的 GPIO 号 (默认 10 11)")
+                        help="额外放行的 GPIO 号 (默认 10 11 43 44)")
     args = parser.parse_args()
-    extra_pins = args.pins if args.pins else [10, 11]
+    extra_pins = args.pins if args.pins else [10, 11, 43, 44]
     problems = []
 
     # ---- 补丁 1: telemetrix 引脚表 ----
