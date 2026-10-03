@@ -11,6 +11,10 @@
 
 注意: 速率是按"电量百分比"算的, 而电量计分辨率只有 1%, 所以要看到可信的
 数字至少得跑十几分钟; 短于一分钟的变化基本都是噪声。
+
+低电保护: 固件在电量低于阈值时会置 flags 的 bit4 (低电), 低于严重阈值再置
+bit5 (严重低电, 此时板子已经自动停推流 + 拒绝开摄像头)。这里会把这两种情况
+直接打在每一行后面, 方便你在它被过放保护板拉闸之前去充电。
 """
 
 import argparse
@@ -105,6 +109,14 @@ def main():
             line = '%s  电量 %3s%%  电压 %.3f V  %s  样本 %d' % (
                 stamp, pct, mv / 1000.0,
                 ('充电中' if chg else ('外部供电' if ext else '电池供电')), samples)
+            # 固件 0x14 的 flags bit4/bit5 (低电 / 严重低电): 严重低电时板子已经
+            # 自己停掉推流并拒绝开摄像头, 挡在电池过放保护前面 —— 要显眼地说出来。
+            if ext or chg:
+                pass                     # 插着 USB / 正在充, 不算低电
+            elif last.get('critical'):
+                line += '   <<< 严重低电：板子已停推流，请立即充电'
+            elif last.get('low'):
+                line += '   <<< 低电：请充电'
             if first is None:
                 first = last
                 first_t = now

@@ -30,6 +30,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs.h"
 
 #include "tmx_i2c.h"
 
@@ -364,6 +365,24 @@ esp_err_t tmx_power_read(tmx_power_info_t *out)
         out->percent = s_gauge_percent;
     }
 
+    /*
+     * 低电分级 —— 这是"防止过放"的判据来源。
+     *
+     * 只有在**电池供电、而且真的在读放电**时才算低电: 插着 USB / 正在充电时
+     * 电量低是正常的, 不该告警, 更不该停推流。
+     * 读不到电量 (-1) 时不猜, 一律 NORMAL —— 宁可漏报也别拿假数据去停人家的推流。
+     */
+    if (!out->battery_present || out->read_error || out->percent < 0 ||
+            out->external_power || out->charging) {
+        out->level = TMX_POWER_LEVEL_NORMAL;
+    } else if (out->percent <= CONFIG_TMX_BATTERY_CRITICAL_PERCENT) {
+        out->level = TMX_POWER_LEVEL_CRITICAL;
+    } else if (out->percent <= CONFIG_TMX_BATTERY_LOW_PERCENT) {
+        out->level = TMX_POWER_LEVEL_LOW;
+    } else {
+        out->level = TMX_POWER_LEVEL_NORMAL;
+    }
+
     /* 电流是算出来的 (见文件头), 这里只填最近一次算出的平均值 */
     out->rate_valid = s_rate_valid;
     out->rate_pph_x10 = s_rate_valid ? s_rate_x10 : RATE_UNKNOWN;
@@ -473,4 +492,51 @@ bool tmx_power_poll(tmx_power_info_t *out)
 bool tmx_power_external_power(void)
 {
     return s_external_seen;
+}
+
+/* ------------------------------------------------------------------ */
+/* 低电保护关机: 把"上次是为什么没的"存进 NVS                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 低电保护是自己给自己断电 (给 AXP2101 写 0x10 的 bit0), 断电之后 RAM 全丢,
+ * 下次开机只能看到一句 POWERON —— 跟"电池保护板拉闸""USB 被拔了"长得一模一样。
+ * 这里在关机前往 NVS 记一笔, 下次开机就能明确地说"上次是电量太低自己关的"。
+ *
+ * 存的是 percent+1, 这样 0 就等于"没有记录"(NVS 里没这个键时读出来也是 0)。
+ */
+#define NVS_NS_LOWBAT      "tmxpower"
+#define NVS_KEY_LOWBAT_OFF "low_pwr_off"
+
+void tmx_power_note_low_battery_shutdown(int percent)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NS_LOWBAT, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    if (nvs_set_i32(handle, NVS_KEY_LOWBAT_OFF, (int32_t)percent + 1) == ESP_OK) {
+        nvs_commit(handle);
+    }
+    nvs_close(handle);
+}
+
+bool tmx_power_take_low_battery_shutdown(int *percent)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NS_LOWBAT, NVS_READWRITE, &handle) != ESP_OK) {
+        return false;
+    }
+    int32_t stored = 0;
+    bool found = (nvs_get_i32(handle, NVS_KEY_LOWBAT_OFF, &stored) == ESP_OK) &&
+                 (stored > 0);
+    if (found) {
+        /* 读一次就清掉: 免得以后每次开机都报"上次低电关机" */
+        nvs_erase_key(handle, NVS_KEY_LOWBAT_OFF);
+        nvs_commit(handle);
+        if (percent != NULL) {
+            *percent = (int)stored - 1;
+        }
+    }
+    nvs_close(handle);
+    return found;
 }

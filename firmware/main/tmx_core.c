@@ -40,6 +40,16 @@ static const char *TAG = "tmx_core";
 #define TMX_CMD_TIMEOUT_MS      2000 /* 一个包内部字节之间的最大间隔 */
 #define TMX_SONAR_SCAN_MS       33
 #define TMX_ANALOG_DEFAULT_MS   19
+/*
+ * 发一包数据最多允许卡多久。TCP 发送缓冲写满时 send() 会按 SO_SNDTIMEO=2s
+ * 超时返回 EAGAIN; 超过这个总时限就说明对端根本没在读, 直接断开这条连接
+ * (见 tmx_core_send), 避免服务器任务永久卡死在一帧上。
+ */
+#define TMX_SEND_STALL_MS       3000
+
+/* AXP2101: 寄存器 0x10 的 bit0 = 关机 (与 Waveshare BSP 的 Axp2101::PowerOff 一致) */
+#define TMX_PMIC_ADDR           0x34
+#define TMX_PMIC_REG_POWER_OFF  0x10
 
 typedef struct {
     uint8_t mode;
@@ -63,6 +73,8 @@ static int           s_client = -1;
 static uint8_t       s_cmd_buffer[TMX_MAX_COMMAND_LEN];
 static bool          s_stop_reports;
 static uint64_t      s_last_command_ms;   /* 最近一条命令的时刻 (自动省电用) */
+static bool          s_battery_protect;   /* 严重低电卸载保护生效中 (见 battery_protect_check) */
+static uint64_t      s_battery_shutdown_at_ms;  /* != 0 = 低电保护已在倒计时关机 */
 static uint32_t      s_analog_interval_ms = TMX_ANALOG_DEFAULT_MS;
 static uint64_t      s_analog_last_ms;
 static uint64_t      s_sonar_last_ms;
@@ -155,6 +167,7 @@ bool tmx_core_send(const uint8_t *packet, size_t len)
     }
 
     size_t sent = 0;
+    uint64_t deadline = now_ms() + TMX_SEND_STALL_MS;
     while (sent < len) {
         int n = send(s_client, packet + sent, len - sent, 0);
         if (n > 0) {
@@ -162,6 +175,21 @@ bool tmx_core_send(const uint8_t *packet, size_t len)
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            if (now_ms() >= deadline) {
+                /*
+                 * PC 端长时间不读: 绝对不能在这里无限重试。以前是
+                 * "vTaskDelay(1) 后接着试", 于是服务器任务永远停在这一帧上 ——
+                 * 不再读命令、也不再关 socket, PC 侧看到的就是"连着但哑了",
+                 * 两边都没有任何日志, 只能人工重启网关。
+                 * 这里主动把连接掐掉: 紧接着的 recv() 会返回 0, 上面
+                 * while (tmx_core_poll()) 退出, 服务器回到 accept() 等下一个
+                 * 客户端, 链路几秒内自己就恢复了。
+                 */
+                ESP_LOGW(TAG, "发送卡住超过 %d ms (对端没在读?), 主动断开这条连接",
+                         TMX_SEND_STALL_MS);
+                shutdown(s_client, SHUT_RDWR);
+                return false;
+            }
             vTaskDelay(1);
             continue;
         }
@@ -797,6 +825,23 @@ static void cmd_camera_snapshot(void)
     if (interval_ms == 0) {
         interval_ms = CONFIG_TMX_CAMERA_STREAM_INTERVAL_MS;
     }
+
+    /*
+     * 严重低电时拒绝开摄像头: 摄像头是板上最大的电流尖峰, 这时候让它转起来
+     * 很可能直接把电池保护板顶到拉闸 (整机掉电, 要插 USB 才醒)。
+     * PC 侧的看门狗会每 10 秒重试一次, 所以这里限一下日志, 别刷屏。
+     */
+    if (s_battery_protect) {
+        static uint64_t last_warn_ms;
+        uint64_t now = now_ms();
+        if (now - last_warn_ms >= 30000) {
+            last_warn_ms = now;
+            ESP_LOGW(TAG, "电量极低: 拒绝开摄像头 (低电保护), 请先充电");
+        }
+        tmx_camera_send_info();     /* 让 PC 知道命令到了 (状态里能看到保护) */
+        return;
+    }
+
     tmx_camera_snapshot(frames, interval_ms);
 }
 
@@ -980,6 +1025,109 @@ static void scan_audio_input(void)
  *         电流不是实测的 (AXP2101 没有电流 ADC), 是电量计的变化率 × 容量换算的,
  *         详见 tmx_power.c 文件头。新增字段加在末尾, 老网关会忽略多余字节。
  */
+/*
+ * 低电保护 (防止电池过放)。
+ *
+ * 为什么必须做: 电池保护板一旦欠压就拉闸, 整块板子瞬间掉电, 而且**必须插 USB
+ * 才醒得过来** —— 表现出来就是"板子从网上没了, 重启也没用"。
+ * 摄像头是板上最大的电流尖峰, 在电量将尽时把它停掉, 就能把这次意外掉电挡在
+ * 前面, 留出时间去充电。
+ *
+ * 只在"电池供电 + 没在充电"时生效 (level 已经把这个条件算进去了, 见 tmx_power.c);
+ * 插上 USB / 开始充电后 level 回到 NORMAL, 这里自动解除。
+ */
+static void battery_protect_check(const tmx_power_info_t *info)
+{
+#if CONFIG_TMX_BATTERY_PROTECT
+    if (info->level < TMX_POWER_LEVEL_CRITICAL) {
+        if (s_battery_protect) {
+            s_battery_protect = false;
+            s_battery_shutdown_at_ms = 0;
+            ESP_LOGW(TAG, "低电保护解除 (电量 %d%%, 已接外部供电或电量回升): "
+                          "摄像头恢复正常", info->percent);
+        }
+        return;
+    }
+    if (s_battery_protect) {
+        return;     /* 已经在保护里, 别重复刷日志 / 重复停 (关机由 battery_shutdown_poll 走) */
+    }
+    s_battery_protect = true;
+    const char *extra = "";
+#if CONFIG_TMX_BATTERY_SHUTDOWN
+    extra = (CONFIG_TMX_BATTERY_SHUTDOWN_DELAY_MS == 0) ? ", 立刻关机" : ", 稍后关机";
+#endif
+    ESP_LOGE(TAG, "电量极低 (%d%%, %d mV): 进入低电保护 —— 停掉推流并拒绝新开摄像头%s。"
+                  "请尽快充电。", info->percent, info->battery_mv, extra);
+    tmx_camera_stop();
+#if CONFIG_TMX_BATTERY_SHUTDOWN
+    s_battery_shutdown_at_ms = now_ms() + (uint64_t)CONFIG_TMX_BATTERY_SHUTDOWN_DELAY_MS;
+#endif
+#else
+    (void)info;
+#endif
+}
+
+/*
+ * 低电保护关机 (防止电池过放)。
+ *
+ * 到这一步说明: 电量已经在严重低电区, battery_protect_check 已经停掉推流并
+ * 上报过带"严重低电"标志的状态。这里等倒计时到点, 再确认一次"还在放电 + 还是
+ * 严重低电" (防止这期间插上 USB), 然后给 AXP2101 写关机命令, 整块板子断电。
+ *
+ * 为什么自己关而不是等保护板欠压拉闸: 拉闸同样是断电, 但那时电芯已经被拉到很
+ * 深了; 而且之后分不清是"低电"还是"板子坏了"。自己关机会往 NVS 记一笔, 下次
+ * 开机串口就能明说。
+ */
+static void battery_shutdown_poll(void)
+{
+#if CONFIG_TMX_BATTERY_PROTECT && CONFIG_TMX_BATTERY_SHUTDOWN
+    if (s_battery_shutdown_at_ms == 0 || now_ms() < s_battery_shutdown_at_ms) {
+        return;
+    }
+
+    /*
+     * 关机前复查一次, 但**只看"有没有插上外部供电"**:
+     * 卸掉推流之后电池电压会回弹一点, 如果拿"电量回到阈值以上"当取消条件,
+     * 那就永远关不掉了 —— 用户要的就是到点直接断。
+     */
+    tmx_power_info_t info;
+    if (tmx_power_read(&info) != ESP_OK) {
+        /*
+         * 读不到 PMIC 就别赌: 关机是不可逆的, 这时候宁可退回到"只停推流"。
+         * (电量判定本来就建立在能读到电压/STATUS 之上, 读不到就不该关机。)
+         */
+        s_battery_shutdown_at_ms = 0;
+        ESP_LOGE(TAG, "关机前复查读不到 PMIC, 放弃关机 (只停推流)");
+        return;
+    }
+    if (info.external_power || info.charging || !info.battery_present) {
+        /* 接上 USB / 正在充电 / 干脆没电池 -> 永远不关机 */
+        s_battery_shutdown_at_ms = 0;
+        ESP_LOGW(TAG, "关机前复查: 已接 USB 或外部供电 (电量 %d%%), 不关机", info.percent);
+        return;
+    }
+
+    s_battery_shutdown_at_ms = 0;       /* 只试一次, 写不进去也别在这儿死循环 */
+    int percent = info.percent;
+    tmx_power_note_low_battery_shutdown(percent);
+    ESP_LOGE(TAG, "低电保护: 电量 %d%%, 现在关机 (防电池过放)。充电后重新上电即可。",
+             percent);
+
+    uint8_t value = 0;
+    size_t len = 0;
+    if (tmx_i2c_read(TMX_PMIC_ADDR, TMX_PMIC_REG_POWER_OFF, 1, false,
+                     &value, 1, &len) == ESP_OK && len == 1) {
+        uint8_t buf[2] = { TMX_PMIC_REG_POWER_OFF, (uint8_t)(value | 0x01) };
+        if (tmx_i2c_write(TMX_PMIC_ADDR, buf, sizeof(buf)) != ESP_OK) {
+            ESP_LOGE(TAG, "关机命令写失败; 只停推流, 等电池保护板自己拉闸");
+        }
+    } else {
+        ESP_LOGE(TAG, "PMIC 没应答, 写不了关机命令; 只停推流, 等电池保护板自己拉闸");
+    }
+    vTaskDelay(pdMS_TO_TICKS(300));     /* 让 I2C/日志落地, 之后芯片自己断电 */
+#endif
+}
+
 static void scan_power(void)
 {
     tmx_power_info_t info;
@@ -988,16 +1136,23 @@ static void scan_power(void)
     }
     uint8_t flags = 0;
     if (info.battery_present) {
-        flags |= 0x01;
+        flags |= TMX_POWER_FLAG_PRESENT;
     }
     if (info.external_power) {
-        flags |= 0x02;
+        flags |= TMX_POWER_FLAG_EXTERNAL;
     }
     if (info.charging) {
-        flags |= 0x04;
+        flags |= TMX_POWER_FLAG_CHARGING;
     }
     if (info.read_error) {
-        flags |= 0x08;
+        flags |= TMX_POWER_FLAG_READ_ERROR;
+    }
+    /* 低电告警 / 严重低电 (bit4/bit5): PC 侧用来看"要不要充电" */
+    if (info.level >= TMX_POWER_LEVEL_LOW) {
+        flags |= TMX_POWER_FLAG_LOW;
+    }
+    if (info.level >= TMX_POWER_LEVEL_CRITICAL) {
+        flags |= TMX_POWER_FLAG_CRITICAL;
     }
     uint8_t packet[12];
     packet[0] = 11;                      /* 之后的字节数 = 报告码(1) + 数据(10) */
@@ -1013,6 +1168,9 @@ static void scan_power(void)
     packet[10] = (uint8_t)((info.rate_pph_x10 >> 8) & 0xff);
     packet[11] = (uint8_t)(info.rate_pph_x10 & 0xff);
     tmx_core_send(packet, sizeof(packet));
+
+    /* 上报发不发得出去都要做保护: 就算 PC 那边断了, 也不能让电池过放 */
+    battery_protect_check(&info);
 }
 
 /*
@@ -1220,6 +1378,8 @@ bool tmx_core_poll(void)
     scan_tts_mirror();
     /* 电池: 电压/电量/充电状态 (变化时上报, 30 秒心跳) */
     scan_power();
+    /* 低电保护: 到点就关机。scan_power 只在上报时才跑, 倒计时得每一轮都看 */
+    battery_shutdown_poll();
     /* 自动省电: 电池供电 + 空闲时把 WiFi/背光降下来 */
     scan_power_save();
     /* 摄像头: 该拍就拍, 有帧要发就分片发给 PC */

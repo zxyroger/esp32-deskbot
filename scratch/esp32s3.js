@@ -159,6 +159,9 @@
         this.batteryPercentValue = -1;      // -1 = 还不知道
         this.batteryCurrentMa = null;       // 正 = 充电, 负 = 放电 (估算); null = 还没测出来
         this.batteryRatePph = null;         // 放电速率 %/h, null = 还没测出来
+        // 名字带 Flag 是为了不和积木方法 batteryLow() 撞名 (实例属性会把原型方法盖掉)
+        this.batteryLowFlag = false;        // 电量低于"低电阈值"(固件 flags bit4)
+        this.batteryCriticalFlag = false;   // 严重低电: 固件已停推流 + 拒绝开摄像头
         this.streamQuality = CAMERA_STREAM_DEFAULT_QUALITY;   // 「视频质量」积木设的
         this.qualityBeforeStream = -1;      // 开流前的拍照质量, 关流时还回去
     }
@@ -664,6 +667,12 @@
                     text: '电池放电速度（%/小时）',
                     arguments: {}
                 },
+                {
+                    opcode: 'batteryLow',
+                    blockType: Scratch.BlockType.BOOLEAN,
+                    text: '电池电量低？',
+                    arguments: {}
+                },
                 '---',
                 {
                     opcode: 'boardStatus',
@@ -839,6 +848,10 @@
                 // 固件用 255 表示"读不到", 网关会转成 -1; 这里只认 0~100, 其余当未知
                 self.batteryPercentValue = (isFinite(percent) && percent >= 0 && percent <= 100)
                     ? percent : -1;
+                // 低电告警 / 严重低电 (固件 flags bit4/bit5 -> 网关 low/critical)。
+                // 老网关没有这两个字段 -> undefined -> false, 不会误报。
+                self.batteryLowFlag = !!msg['low'];
+                self.batteryCriticalFlag = !!msg['critical'];
             }
             // 有板子数据回来 = 整条链路 (Scratch→网关→板子→回传) 是通的
             if (self.statusState === 'connecting') {
@@ -1492,7 +1505,31 @@
         if (this.batteryCharging) {
             return '充电中';
         }
-        return this.batteryExternal ? '外部供电' : '电池供电';
+        if (this.batteryExternal) {
+            // 插着 USB 时电量低不算问题 (正在充/够用), 不在这里报警
+            return '外部供电';
+        }
+        // 严重低电时固件已经自己停掉推流并拒绝开摄像头 (挡在电池过放保护前面),
+        // 这里必须把原因说清楚, 否则用户只看到"画面没了"。
+        if (this.batteryCriticalFlag) {
+            return '电量极低，已停推流，请立即充电';
+        }
+        if (this.batteryLowFlag) {
+            return '电量低，请充电';
+        }
+        return '电池供电';
+    };
+
+    /*
+     * 「电池电量低?」积木: 电量掉到低电阈值以下就是 true。
+     * 严重低电时固件报的是 flags 的 bit4+bit5 同时置位, 所以这里也是 true ——
+     * 可以当成"该去充电了"的判据; 到底到了哪一档看「电池状态」的文字。
+     */
+    Esp32S3.prototype.batteryLow = function () {
+        if (this.batteryReadError || !this.batteryPresent) {
+            return false;       // 读不到就别乱报"低电"
+        }
+        return !!(this.batteryLowFlag || this.batteryCriticalFlag);
     };
 
     /*

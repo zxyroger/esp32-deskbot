@@ -150,6 +150,8 @@ function Start-Component {
 }
 
 function Test-Esp32GatewayHealth {
+    param([string]$Reason = '接收循环已失效')
+
     # 记录上次连上的板子 IP (重启日志前先读, 方便排查时对照)
     $lastBoardIp = ''
     $gwLog = Join-Path $LogDir 'esp32gw.log'
@@ -159,7 +161,9 @@ function Test-Esp32GatewayHealth {
         if ($hit) { $lastBoardIp = $hit.Matches[0].Groups[1].Value }
     }
 
-    Write-Log "esp32gw 的接收循环已失效 (stderr 出现未处理异常), 重启它"
+    # 不要把原因写死成"stderr 出现未处理异常": 这条路径有两个触发源
+    # (err 日志变大 / 连接已经不在了), 写死会把排查带偏。
+    Write-Log "esp32gw 需要重启: $Reason"
     if ($lastBoardIp) {
         Write-Log "  上次连上的板子是 $lastBoardIp"
     }
@@ -367,7 +371,7 @@ while ($true) {
             Start-Component -Name 'esp32gw'
         } elseif ((Get-ErrorLogSize 'esp32gw') -gt [int]$errorLogBaseline['esp32gw']) {
             # 进程在, 但接收循环已经死了 -> 重启
-            Test-Esp32GatewayHealth
+            Test-Esp32GatewayHealth -Reason '接收循环抛了未处理的异常 (err 日志变大)'
         } elseif ($script:linkCheckCounter -ge 5) {
             # 每 5 个循环查一次真实连接: 日志说已连接但这会儿没有 TCP 连接 -> 僵尸网关
             $script:linkCheckCounter = 0
@@ -375,7 +379,7 @@ while ($true) {
             if ($linkFacts.Address -and
                 -not (Test-BoardLinkAlive -Address $linkFacts.Address)) {
                 Write-Log "板子的 TCP 连接已经不在了 (日志仍写着已连接 $($linkFacts.Address)), 重启网关"
-                Test-Esp32GatewayHealth
+                Test-Esp32GatewayHealth -Reason '日志说已连接, 但已经没有到板子的真实 TCP 连接'
             }
         }
         $script:linkCheckCounter++

@@ -24,6 +24,7 @@
 #include "display_ili9341.h"
 #include "tmx_audio.h"
 #include "tmx_camera.h"
+#include "tmx_power.h"
 
 static const char *TAG = "app";
 
@@ -71,6 +72,17 @@ void app_main(void)
     ESP_LOGI(TAG, "=================================================");
 
     init_nvs();
+
+    /*
+     * 上次是不是"低电保护主动关机"? 这个记在 NVS 里, 掉电不会丢 ——
+     * 否则它跟掉电/保护板拉闸长得一模一样 (都只有一句 POWERON)。
+     */
+    int low_batt_percent = -1;
+    if (tmx_power_take_low_battery_shutdown(&low_batt_percent)) {
+        ESP_LOGW(TAG, "上次是低电保护主动关机 (当时电量约 %d%%), 不是掉电、也不是崩溃",
+                 low_batt_percent);
+    }
+
     ESP_ERROR_CHECK(tmx_core_init());
 
 #if CONFIG_TMX_LCD_ENABLE

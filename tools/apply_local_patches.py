@@ -1041,6 +1041,141 @@ def patch_telemetrix_dispatch_guard(path):
     return True, bak
 
 
+# ---- 补丁 16: 接收循环要能"超时/EOF 就断开", 不能无声卡死 ----
+#
+# 补丁 10 让 read() 读满再返回, 补丁 11 兜住了异常, 但还差两条:
+#   1) 对端关连接时 read() 返回空字节, 上游 ord(b'') 抛 TypeError,
+#      except 里 continue -> 变成 100% CPU 的死循环, 一行日志都没有;
+#   2) 对端只是"不发了"(没关连接) 时, await 会永远等下去。
+# 这两种情况 socket 都还是 ESTABLISHED, 板子那边也会跟着卡在发送重试里,
+# 整条链路从此彻底没有数据, 只能人工重启网关 —— 2026-10-03 那次就是它。
+# 这里给读操作加超时, 超时/EOF/读失败一律主动拆连接; 守护进程每 5 秒会查
+# "日志说已连接但实际没有 ESTABLISHED 连接", 于是自动重启网关并重发板子 IP。
+TRANSPORT_IMPORTS_OLD = (
+    "import asyncio\n"
+    "import struct\n"
+    "import sys\n"
+    "import time\n"
+)
+
+TRANSPORT_IMPORTS_NEW = (
+    "import asyncio\n"
+    "import struct\n"
+    "import sys\n"
+    "import time\n"
+    "\n"
+    "# 本地补丁 16: 等板子数据的超时 (秒)。板子连着的时候至少每 30 秒有一条\n"
+    "# 电量上报, 所以「这么久一个字节都没有」= 链路卡死, 主动断连让守护进程\n"
+    "# 重启网关。\n"
+    "TRANSPORT_READ_TIMEOUT_S = 120.0\n"
+)
+
+TRANSPORT_FORCE_CLOSE_OLD = (
+    "    # noinspection PyArgumentList\n"
+    "    async def _wifi_report_dispatcher(self):\n"
+)
+
+TRANSPORT_FORCE_CLOSE_NEW = (
+    "    def _force_close_transport(self):\n"
+    "        # 本地补丁 16: 主动拆掉到板子的 TCP 连接。不这么做的话, 接收循环\n"
+    "        # 即使退出了, socket 还挂在 ESTABLISHED 上, 守护进程那种「有没有\n"
+    "        # 真实连接」的检查就发现不了, 只能人工重启网关。\n"
+    "        try:\n"
+    "            writer = getattr(self.transport, 'writer', None)\n"
+    "            if writer is not None:\n"
+    "                writer.close()\n"
+    "        except Exception as exc:\n"
+    "            print('force close transport failed: %r' % (exc,))\n"
+    "\n"
+    "    # noinspection PyArgumentList\n"
+    "    async def _wifi_report_dispatcher(self):\n"
+)
+
+TRANSPORT_READ_LOOP_OLD = (
+    "        while True:\n"
+    "            if self.shutdown_flag:\n"
+    "                break\n"
+    "            try:\n"
+    "                packet_length = ord(await self.transport.read())\n"
+    "            except TypeError:\n"
+    "                continue\n"
+)
+
+TRANSPORT_READ_LOOP_NEW = (
+    "        while True:\n"
+    "            if self.shutdown_flag:\n"
+    "                break\n"
+    "            # 本地补丁 16: 给读操作加超时, 并且正确处理 EOF。详见本文件\n"
+    "            # 上面「补丁 16」那段注释。\n"
+    "            try:\n"
+    "                raw = await asyncio.wait_for(self.transport.read(),\n"
+    "                                             TRANSPORT_READ_TIMEOUT_S)\n"
+    "            except asyncio.TimeoutError:\n"
+    "                print('telemetrix: %.0f 秒没收到板子任何数据, 判定链路卡死, '\n"
+    "                      '主动断开让守护进程重启网关' % TRANSPORT_READ_TIMEOUT_S)\n"
+    "                self._force_close_transport()\n"
+    "                break\n"
+    "            except (OSError, ConnectionError) as exc:\n"
+    "                print('telemetrix: 读板子失败 %r, 主动断开' % (exc,))\n"
+    "                self._force_close_transport()\n"
+    "                break\n"
+    "            if not raw:\n"
+    "                print('telemetrix: 板子关闭了连接 (EOF), 主动断开等重连')\n"
+    "                self._force_close_transport()\n"
+    "                break\n"
+    "            packet_length = ord(raw)\n"
+)
+
+
+def patch_telemetrix_read_timeout(path):
+    """给接收循环加读超时并把 EOF 当断线; 返回 (是否改动, 备份路径)"""
+    text = path.read_text(encoding="utf-8")
+    if "本地补丁 16" in text:
+        return False, None
+    if (TRANSPORT_IMPORTS_OLD not in text
+            or TRANSPORT_FORCE_CLOSE_OLD not in text
+            or TRANSPORT_READ_LOOP_OLD not in text):
+        return None, None
+    bak = backup(path)
+    text = text.replace(TRANSPORT_IMPORTS_OLD, TRANSPORT_IMPORTS_NEW, 1)
+    text = text.replace(TRANSPORT_FORCE_CLOSE_OLD, TRANSPORT_FORCE_CLOSE_NEW, 1)
+    text = text.replace(TRANSPORT_READ_LOOP_OLD, TRANSPORT_READ_LOOP_NEW, 1)
+    path.write_text(text, encoding="utf-8")
+    return True, bak
+
+
+# ---- 补丁 17: 电池"低电/严重低电"标志转给 Scratch ----
+#
+# 固件 0x14 的 flags 字节新加了 bit4 (低电告警) 和 bit5 (严重低电, 固件已经停推流
+# 并拒绝开摄像头)。这两个标志必须传下去, 否则用户在 Scratch 里只看到"画面没了"
+# 却不知道为什么。老固件没有这两位 -> 自动是 False, 不会误报。
+POWER_LOW_OLD = (
+    "            'rate_pph_x10': rate_pph_x10,\n"
+    "        }, 'from_esp32_gateway')\n"
+)
+
+POWER_LOW_NEW = (
+    "            'rate_pph_x10': rate_pph_x10,\n"
+    "            # 本地补丁 17: 低电告警 / 严重低电 (固件 flags bit4/bit5)\n"
+    "            'low': bool(flags & 0x10),\n"
+    "            'critical': bool(flags & 0x20),\n"
+    "        }, 'from_esp32_gateway')\n"
+)
+
+
+def patch_esp32_gateway_power_low(path):
+    """把电量 low/critical 标志转给 Scratch; 返回 (是否改动, 备份路径)"""
+    text = path.read_text(encoding="utf-8")
+    if "本地补丁 17" in text:
+        return False, None
+    if POWER_LOW_OLD not in text:
+        return None, None
+    bak = backup(path)
+    text = text.replace(POWER_LOW_OLD, POWER_LOW_NEW, 1)
+    path.write_text(text, encoding="utf-8")
+    return True, bak
+
+
 def main():
     parser = argparse.ArgumentParser(description="给第三方包打本地补丁")
     parser.add_argument("pins", nargs="*", type=int, default=None,
@@ -1176,6 +1311,16 @@ def main():
         else:
             problems.append("esp32_gateway.py 里找不到电池放电速率补丁的代码, 请先检查补丁 14")
 
+        # ---- 补丁 17: 电池低电/严重低电 标志 ----
+        changed, bak = patch_esp32_gateway_power_low(esp32_gateway)
+        if changed:
+            print("  [17] 电池低电标志: 已把 flags bit4/bit5 转成 low / critical")
+            print("        备份: %s" % bak)
+        elif changed is False:
+            print("  [17] 电池低电标志: 已是补丁状态, 无需改动")
+        else:
+            problems.append("esp32_gateway.py 里找不到电池上报补丁的代码, 请先检查补丁 13")
+
     # ---- 补丁 10: telemetrix 的 WiFi 读函数要读满 (一帧几十片, 必踩短读) ----
     transport = find_module_path("telemetrix_aio_esp32.socket_aio_transport")
     if not transport or not transport.exists():
@@ -1199,6 +1344,16 @@ def main():
             print("          备份: %s" % bak)
         elif changed is False:
             print("  [11/11] 接收循环: 已是补丁状态, 无需改动")
+        else:
+            problems.append("telemetrix_aio_esp32.py 的接收循环与预期不一致, 请手动检查")
+
+        # ---- 补丁 16: 接收循环加读超时 (链路卡死时能自愈) ----
+        changed, bak = patch_telemetrix_read_timeout(telemetrix)
+        if changed:
+            print("  [16] 接收循环读超时: 卡死/EOF 时主动断连, 守护进程会自动重启网关")
+            print("          备份: %s" % bak)
+        elif changed is False:
+            print("  [16] 接收循环读超时: 已是补丁状态, 无需改动")
         else:
             problems.append("telemetrix_aio_esp32.py 的接收循环与预期不一致, 请手动检查")
 
